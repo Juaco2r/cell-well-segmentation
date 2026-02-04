@@ -1,30 +1,60 @@
-# cell-well-segmentation
-Classical computer vision pipeline for instance segmentation and feature extraction of low-density cell wells from multi-channel fluorescence microscopy images, with CSV outputs, GeoJSON annotations, and visual previews.
-
 # Cell Well Segmentation and Feature Extraction
 
-Python pipeline for **instance segmentation and feature extraction of low-density cell wells** from multi-channel fluorescence microscopy images.
+Classical computer vision pipeline for **instance segmentation and feature extraction of low-density cell wells** from multi-channel fluorescence microscopy images.
 
-This repository implements a classical computer vision workflow (no deep learning) that produces segmentation masks, per-cell quantitative features, QuPath-compatible annotations, and visualization previews, with an emphasis on robustness and memory management.
+This repository implements a **fully reproducible, non–deep learning workflow** that produces segmentation masks, per-cell quantitative features, QuPath-compatible annotations, and visualization previews, with an emphasis on robustness, clarity, and memory management.
 
 ---
 
 ## Key Features
 
-- Multi-channel TIFF image handling
-- Nuclei-based seed detection
-- Watershed instance segmentation
-- Morphological and intensity feature extraction
-- CSV export of per-cell features
-- GeoJSON annotations compatible with **QuPath**
-- Visualization previews for quality control
-- Designed for **non-dense cell wells**
+- Multi-channel TIFF image handling  
+- Nuclei-based seed detection  
+- Marker-controlled watershed instance segmentation  
+- Morphological and intensity feature extraction  
+- CSV export of per-cell features  
+- GeoJSON annotations compatible with **QuPath**  
+- Visualization previews for quality control  
+- Designed for **low-density cell wells**  
+- No machine learning or deep learning dependencies  
+
+---
+
+## Repository Structure
+
+```
+cell-well-segmentation/
+│
+├── README.md
+├── requirements.txt
+├── pyproject.toml
+├── .gitignore
+│
+├── data/
+│   ├── README.md
+│   └── example/
+│       ├── README.md
+│       └── D1_CropMini.tif
+│
+├── src/
+│   └── cellwell/
+│       ├── __init__.py
+│       ├── pipeline.py
+│       └── cli.py
+│
+├── tests/
+│   └── test_code.py
+│
+└── docs/
+```
 
 ---
 
 ## Input Data Format
 
-**Input:** multi-channel fluorescence TIFF image
+**Input:** multi-channel fluorescence microscopy images stored as TIFF files (`.tif` or `.tiff`).
+
+Each input image is processed independently and generates a corresponding output folder.
 
 ### Channel Convention
 
@@ -37,7 +67,8 @@ The pipeline assumes the following channel order:
 | 2 | Marker channel (green) |
 | 3 | Cytoplasmic stain (CellCyto) |
 
-⚠️ **Important:** If your data uses a different channel order, you must update the channel mapping in `create_channel_images()`.
+⚠️ **Important:**  
+If your data uses a different channel order, the channel mapping must be updated in `create_channel_images()` within `pipeline.py`.
 
 ---
 
@@ -51,20 +82,35 @@ cd cell-well-segmentation
 pip install -r requirements.txt
 ```
 
-- Python ≥ 3.9 is recommended
-- Tested on Windows and Linux
+Install the project in editable mode (required for the `src/` layout):
+
+```bash
+pip install -e .
+```
+
+**Requirements**
+- Python ≥ 3.9  
+- Tested on Windows and Linux  
 
 ---
 
-## Running the Pipeline
+## Running the Pipeline (Recommended)
 
-At the current stage, input files are defined directly inside the script.
+The pipeline is executed via a **command-line interface (CLI)**.
+
+### Run on the provided example data
 
 ```bash
-python src/cellwell/pipeline.py
+python -m cellwell.cli --input "data/example/D1_CropMini.tif"
 ```
 
-Each input image is processed independently and generates a corresponding output folder.
+### Run on your own data
+
+```bash
+python -m cellwell.cli --input "path/to/your/data/*.tif"
+```
+
+For each input file, an output folder is created automatically.
 
 ---
 
@@ -72,29 +118,48 @@ Each input image is processed independently and generates a corresponding output
 
 For each processed image, the following files are generated:
 
-### `RGB.tif`
-RGB composite image created from selected channels.
+- **`RGB.tif`**  
+  RGB composite image created from selected channels.
 
-### `CellCyto.tif`
-Composite image highlighting cytoplasmic and nuclear signals, used for segmentation.
+- **`CellCyto.tif`**  
+  Composite image highlighting cytoplasmic and nuclear signals, used for segmentation.
 
-### `instances.tif`
-Instance-labeled segmentation mask (uint16), where each cell has a unique label.
+- **`instances.tif`**  
+  Instance-labeled segmentation mask (`uint16`), where each cell has a unique label.
 
-### `cell_features.csv`
-Tabular file containing per-cell quantitative features, including:
+- **`cell_features.csv`**  
+  Per-cell quantitative features, including:
+  - area and perimeter  
+  - per-channel mean, max, median, standard deviation  
+  - coefficient of variation (CV)  
+  - integrated intensity per channel  
+  - centroid coordinates  
 
-- area and perimeter
-- per-channel mean, max, median, standard deviation
-- coefficient of variation (CV)
-- integrated intensity per channel
-- centroid coordinates
+- **`qupath_final.geojson`**  
+  Polygon annotations compatible with **QuPath**, enabling visualization and manual inspection.
 
-### `qupath_final.geojson`
-Polygon annotations compatible with **QuPath**, enabling visualization and manual inspection of segmented cells.
+- **`preview.png`**  
+  Downsampled visualization summarizing nuclei detection, segmentation, and final instances.
 
-### `preview.png`
-Downsampled visualization summarizing nuclei detection, segmentation, and final instances.
+---
+
+## Testing and Reproducibility
+
+Minimal automated tests are provided using **pytest**.
+
+Run tests from the repository root:
+
+```bash
+python -m pytest
+```
+
+Tests verify:
+- correct package installation
+- successful imports
+- end-to-end execution on example data
+
+⚠️ Tests must be run via `pytest`.  
+Direct execution of test files (e.g. `python test_code.py`) is not supported when using a `src/` layout.
 
 ---
 
@@ -102,13 +167,13 @@ Downsampled visualization summarizing nuclei detection, segmentation, and final 
 
 The segmentation pipeline consists of:
 
-1. Gaussian smoothing of the nuclear channel
-2. Local maxima detection for seed generation
-3. Adaptive foreground detection using Otsu thresholding
-4. Marker-controlled watershed segmentation
-5. Post-segmentation filtering based on object area
+1. Gaussian smoothing of the nuclear channel  
+2. Local maxima detection for seed generation  
+3. Adaptive foreground detection using Otsu thresholding  
+4. Marker-controlled watershed segmentation  
+5. Post-segmentation filtering based on object area  
 
-Feature extraction is performed directly on the original-resolution RGB data to preserve intensity fidelity.
+Feature extraction is performed on the original-resolution RGB data to preserve intensity fidelity.
 
 ---
 
@@ -121,21 +186,6 @@ Feature extraction is performed directly on the original-resolution RGB data to 
 
 ---
 
-## Project Structure
-
-```
-cell-well-segmentation/
-├── README.md
-├── requirements.txt
-├── .gitignore
-├── src/
-│   └── cellwell/
-│       └── pipeline.py
-└── docs/
-```
-
----
-
 ## License
 
 This project is released under the **MIT License**.
@@ -144,4 +194,8 @@ This project is released under the **MIT License**.
 
 ## Contact
 
-For questions, suggestions, or issues, please open an issue on GitHub or contact: juaco2r@gmail.com
+For questions, suggestions, or issues, please open an issue on GitHub or contact:
+
+**Jose J. Rodriguez Rojas**  
+📧 juaco2r@gmail.com
+

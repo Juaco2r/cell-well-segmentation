@@ -205,3 +205,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# ================================
+# Imaging data and pipeline outputs
+# ================================
+
+# Ignore all microscopy images by default
+*.tif
+*.tiff
+
+# Ignore generated outputs
+*.png
+*.csv
+*.geojson
+
+# Allow small example data for tests
+!data/example/*.tif

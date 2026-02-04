@@ -163,6 +163,20 @@ Direct execution of test files (e.g. `python test_code.py`) is not supported whe
 
 ---
 
+## Notebook Usage (Optional)
+
+Interactive demonstrations may be provided as Jupyter notebooks.
+
+⚠️ Important
+Notebooks must be executed using the same Python environment used for the CLI.
+
+If you encounter errors such as ModuleNotFoundError, ensure that:
+pip install -r requirements.txt
+pip install -e .
+have been run in the active notebook kernel.
+
+---
+
 ## Method Summary
 
 The segmentation pipeline consists of:

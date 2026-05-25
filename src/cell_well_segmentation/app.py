@@ -1361,7 +1361,12 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
     props_shape = regionprops_table(instance_labels, properties=["label", "area", "perimeter"])
 
     if len(props_shape["label"]) == 0:
-        df = pd.DataFrame()
+        df = pd.DataFrame(columns=[
+            "label", "area_px", "perimeter_px",
+            "red_max", "red_mean", "green_max", "green_mean", "blue_max", "blue_mean",
+            "centroid_y", "centroid_x",
+            "red_positive", "green_positive", "double_positive",
+        ])
         csv_path = Path(output_folder) / "cell_features.csv"
         df.to_csv(csv_path, index=False)
         log("  No cells found. Empty cell_features.csv saved.")
@@ -1402,6 +1407,18 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
     df["red_total"] = df["red_mean"] * df["area_px"]
     df["green_total"] = df["green_mean"] * df["area_px"]
     df["blue_total"] = df["blue_mean"] * df["area_px"]
+
+    # ------------------------------------------------------------
+    # Biological positivity flags
+    # ------------------------------------------------------------
+    # These columns are annotations for downstream analysis. They do not change
+    # segmentation, cell filtering, or Manders computation. A cell is marked as
+    # red_positive/green_positive when its mean channel intensity is greater than
+    # or equal to the user-defined biological threshold. double_positive means
+    # both red_positive and green_positive are True.
+    df["red_positive"] = df["red_mean"] >= float(params.biological_red_threshold)
+    df["green_positive"] = df["green_mean"] >= float(params.biological_green_threshold)
+    df["double_positive"] = df["red_positive"] & df["green_positive"]
 
     before_filter = len(df)
     df = df[
@@ -1505,8 +1522,18 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
             params.biological_green_threshold,
         )
 
+        red_mean = float(np.mean(red_vals))
+        green_mean = float(np.mean(green_vals))
+        red_positive = bool(red_mean >= float(params.biological_red_threshold))
+        green_positive = bool(green_mean >= float(params.biological_green_threshold))
+
         rows.append({
             "label": int(label),
+            "red_mean_for_positivity": red_mean,
+            "green_mean_for_positivity": green_mean,
+            "red_positive": red_positive,
+            "green_positive": green_positive,
+            "double_positive": bool(red_positive and green_positive),
             "global_red_threshold": float(global_red_thr),
             "global_green_threshold": float(global_green_thr),
             "cell_otsu_red_threshold": float(cell_red_thr),
@@ -1536,6 +1563,9 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
     df_manders = pd.DataFrame(rows)
     summary = {
         "n_cells_processed": int(len(df_manders)),
+        "n_red_positive": int(df_manders["red_positive"].sum()) if "red_positive" in df_manders.columns else 0,
+        "n_green_positive": int(df_manders["green_positive"].sum()) if "green_positive" in df_manders.columns else 0,
+        "n_double_positive": int(df_manders["double_positive"].sum()) if "double_positive" in df_manders.columns else 0,
         "global_red_threshold": float(global_red_thr),
         "global_green_threshold": float(global_green_thr),
         "biological_red_threshold": float(params.biological_red_threshold),
@@ -2035,6 +2065,111 @@ def rasterize_geojson_to_mask(geojson_path, shape, log=print):
         log(f"WARNING: Validation GeoJSON had no usable polygons: {geojson_path}")
 
     return mask, int(n_poly)
+
+
+def rasterize_geojson_to_roi_mask(geojson_path, roi_x, roi_y, roi_w, roi_h, log=print):
+    """Rasterize full-image GeoJSON annotations into a selected ROI mask.
+
+    The input GeoJSON must be in the same coordinate system as the original
+    image. Coordinates are shifted from full-image space to ROI-local space by
+    subtracting roi_x and roi_y. This allows Parameter Exploration to calculate
+    DICE/IoU using a complete QuPath GeoJSON without creating a separate ROI
+    GeoJSON file.
+    """
+    from skimage.draw import polygon as draw_polygon
+
+    roi_x = int(roi_x)
+    roi_y = int(roi_y)
+    roi_w = int(roi_w)
+    roi_h = int(roi_h)
+
+    if roi_w <= 0 or roi_h <= 0:
+        raise ValueError(f"ROI size must be positive. Got W={roi_w}, H={roi_h}")
+
+    with open(geojson_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    mask = np.zeros((roi_h, roi_w), dtype=bool)
+    n_poly = 0
+
+    roi_x1 = roi_x + roi_w
+    roi_y1 = roi_y + roi_h
+
+    for exterior, holes in _iter_geojson_polygons(data):
+        try:
+            pts = np.asarray(exterior, dtype=np.float64)
+            if pts.ndim != 2 or pts.shape[0] < 3 or pts.shape[1] < 2:
+                continue
+
+            xs_global = pts[:, 0]
+            ys_global = pts[:, 1]
+
+            # Skip polygons whose bounding box does not intersect the selected ROI.
+            if (np.nanmax(xs_global) < roi_x or np.nanmin(xs_global) > roi_x1 or
+                    np.nanmax(ys_global) < roi_y or np.nanmin(ys_global) > roi_y1):
+                continue
+
+            xs = np.clip(xs_global - roi_x, 0, roi_w - 1)
+            ys = np.clip(ys_global - roi_y, 0, roi_h - 1)
+
+            rr, cc = draw_polygon(ys, xs, shape=(roi_h, roi_w))
+            mask[rr, cc] = True
+            n_poly += 1
+
+            for hole in holes:
+                hpts = np.asarray(hole, dtype=np.float64)
+                if hpts.ndim != 2 or hpts.shape[0] < 3 or hpts.shape[1] < 2:
+                    continue
+
+                hxs_global = hpts[:, 0]
+                hys_global = hpts[:, 1]
+
+                if (np.nanmax(hxs_global) < roi_x or np.nanmin(hxs_global) > roi_x1 or
+                        np.nanmax(hys_global) < roi_y or np.nanmin(hys_global) > roi_y1):
+                    continue
+
+                hxs = np.clip(hxs_global - roi_x, 0, roi_w - 1)
+                hys = np.clip(hys_global - roi_y, 0, roi_h - 1)
+                hrr, hcc = draw_polygon(hys, hxs, shape=(roi_h, roi_w))
+                mask[hrr, hcc] = False
+
+        except Exception:
+            continue
+
+    if n_poly == 0:
+        log(f"WARNING: ROI validation GeoJSON had no usable polygons inside the selected ROI: {geojson_path}")
+
+    return mask, int(n_poly)
+
+
+def make_roi_validation_overlay(base_rgb, pred_mask, gt_mask, alpha=0.70):
+    """Create a readable ROI validation overlay on top of the RGB preview.
+
+    Green = overlap / true positive
+    Red   = prediction only / false positive
+    Blue  = ground truth only / false negative
+    """
+    base = _to_uint8_rgb(base_rgb).astype(np.float32)
+    pred = np.asarray(pred_mask, dtype=bool)
+    gt = np.asarray(gt_mask, dtype=bool)
+
+    if pred.shape != gt.shape:
+        raise ValueError(f"Mask shapes differ. Prediction={pred.shape}, GT={gt.shape}")
+
+    overlay = make_validation_overlay(pred, gt).astype(np.float32)
+    colored = np.any(overlay > 0, axis=-1)
+
+    out = base.copy()
+    out[colored] = (1.0 - float(alpha)) * base[colored] + float(alpha) * overlay[colored]
+
+    try:
+        boundaries = segmentation.find_boundaries(pred.astype(np.uint8) + gt.astype(np.uint8), mode="outer")
+        boundaries = morphology.binary_dilation(boundaries, morphology.disk(1))
+        out[boundaries] = [255, 255, 255]
+    except Exception:
+        pass
+
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def compute_pixel_validation_metrics(pred_mask, gt_mask):
@@ -2848,6 +2983,8 @@ class ParameterExplorationDialog(QDialog):
         self.selected_roi = None
         self.accepted_params = None
         self.backend = None
+        self.gt_geojson_path = ""
+        self.last_roi_validation_report = None
 
         root = QVBoxLayout(self)
 
@@ -2897,6 +3034,20 @@ class ParameterExplorationDialog(QDialog):
         vis_layout.addWidget(self.rgb_label)
         vis_layout.addWidget(self.mask_label)
         root.addWidget(vis_group, 1)
+
+        validation_group = QGroupBox("ROI validation / DICE against full-image GeoJSON")
+        validation_layout = QHBoxLayout(validation_group)
+        self.roi_validation_enable_chk = QCheckBox("Enable ROI DICE")
+        self.roi_validation_enable_chk.setChecked(False)
+        self.roi_validation_browse_btn = QPushButton("Select GT GeoJSON")
+        self.roi_validation_browse_btn.clicked.connect(self.select_roi_validation_geojson)
+        self.roi_validation_status = QLabel("No GT GeoJSON selected")
+        self.roi_validation_status.setWordWrap(True)
+        self.roi_validation_status.setStyleSheet("color: #555;")
+        validation_layout.addWidget(self.roi_validation_enable_chk)
+        validation_layout.addWidget(self.roi_validation_browse_btn)
+        validation_layout.addWidget(self.roi_validation_status, 1)
+        root.addWidget(validation_group)
 
         params_group = QGroupBox("Parameters for this rectangle")
         params_layout = QGridLayout(params_group)
@@ -3041,6 +3192,19 @@ class ParameterExplorationDialog(QDialog):
         pm = _numpy_rgb_to_qpixmap(_downsample_for_preview(rgb, max_side=700))
         label.setPixmap(pm.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
+    def select_roi_validation_geojson(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select full-image ground-truth GeoJSON for ROI DICE",
+            "",
+            "GeoJSON / JSON (*.geojson *.json);;All Files (*)",
+        )
+        if not path:
+            return
+        self.gt_geojson_path = path
+        self.roi_validation_enable_chk.setChecked(True)
+        self.roi_validation_status.setText(f"GT GeoJSON: {path}")
+
     def process_selected_rectangle(self):
         if self.selected_roi is None:
             QMessageBox.warning(self, "No ROI", "Select a rectangle first.")
@@ -3062,10 +3226,52 @@ class ParameterExplorationDialog(QDialog):
             df_features = extract_features(instance_labels, rgb_stack, tmp_output, params, log=lambda m: None)
 
             self._set_label_image(self.rgb_label, rgb_stack)
-            overlay = make_instance_overlay(rgb_stack, instance_labels, alpha=0.42, boundary_thickness=3)
+
+            validation_text = ""
+            if bool(self.roi_validation_enable_chk.isChecked()) and str(self.gt_geojson_path).strip():
+                gt_path = Path(self.gt_geojson_path)
+                if not gt_path.exists():
+                    raise FileNotFoundError(f"Selected GT GeoJSON does not exist: {gt_path}")
+
+                gt_mask, n_gt_polygons = rasterize_geojson_to_roi_mask(
+                    gt_path, x, y, w, h, log=lambda m: None
+                )
+                pred_mask = np.asarray(instance_labels) > 0
+                metrics = compute_pixel_validation_metrics(pred_mask, gt_mask)
+                object_metrics = compute_object_validation_metrics(
+                    instance_labels, gt_mask, iou_threshold=0.50
+                )
+                self.last_roi_validation_report = {
+                    "roi_x": int(x),
+                    "roi_y": int(y),
+                    "roi_width": int(w),
+                    "roi_height": int(h),
+                    "ground_truth_geojson": str(gt_path),
+                    "n_gt_polygons_rasterized_in_roi": int(n_gt_polygons),
+                    **metrics,
+                    **object_metrics,
+                }
+                overlay = make_roi_validation_overlay(rgb_stack, pred_mask, gt_mask, alpha=0.70)
+                validation_text = (
+                    f" | ROI DICE: {metrics['dice_pixel']:.4f}; "
+                    f"IoU: {metrics['iou_pixel']:.4f}; "
+                    f"Precision: {metrics['precision_pixel']:.4f}; "
+                    f"Recall: {metrics['recall_pixel']:.4f}; "
+                    f"GT polygons: {n_gt_polygons}"
+                )
+                self.roi_validation_status.setText(
+                    f"GT GeoJSON: {gt_path} | DICE={metrics['dice_pixel']:.4f}, "
+                    f"IoU={metrics['iou_pixel']:.4f}, Precision={metrics['precision_pixel']:.4f}, "
+                    f"Recall={metrics['recall_pixel']:.4f}"
+                )
+            else:
+                overlay = make_instance_overlay(rgb_stack, instance_labels, alpha=0.42, boundary_thickness=3)
+                self.last_roi_validation_report = None
+
             self._set_label_image(self.mask_label, overlay)
             self.log_label.setText(
                 f"ROI processed. Raw instances: {n_after}; valid feature cells after area filter: {len(df_features)}."
+                f"{validation_text}"
             )
             cleanup_memory()
         except Exception as e:

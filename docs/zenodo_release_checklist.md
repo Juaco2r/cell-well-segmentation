@@ -7,6 +7,8 @@
 5. Push to GitHub.
 6. Create a GitHub release using a tag such as `v1.0.0`.
 7. Let Zenodo archive the GitHub release.
+8. Confirm DOI: 10.5281/zenodo.20387083.
+9. Confirm badge: https://zenodo.org/badge/1149252759.svg.
 8. Copy the generated DOI into:
    - `README.md`
    - `CITATION.cff`

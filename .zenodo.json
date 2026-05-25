@@ -26,6 +26,12 @@
       "identifier": "https://github.com/Juaco2r/cell-well-segmentation",
       "relation": "isSupplementTo",
       "scheme": "url"
+    },
+    {
+      "identifier": "10.5281/zenodo.20387083",
+      "relation": "isIdenticalTo",
+      "scheme": "doi"
     }
-  ]
+  ],
+  "doi": "10.5281/zenodo.20387083"
 }

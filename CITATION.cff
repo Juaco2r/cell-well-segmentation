@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it using the metadata below."
 title: "Cell Well Segmentation: Immunofluorescence Cell Segmentation, Quantification and Validation"
 version: "1.0.0"
-doi: "ADD_ZENODO_DOI_HERE"
+doi: "10.5281/zenodo.20387083"
 date-released: "2026-05-26"
 type: software
 authors:

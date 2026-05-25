@@ -1,10 +1,16 @@
 # Cell Well Segmentation
 
+[![DOI](https://zenodo.org/badge/1149252759.svg)](https://doi.org/10.5281/zenodo.20387083)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](pyproject.toml)
+
 **Cell Well Segmentation** is a Python/PyQt5 desktop application for immunofluorescence cell segmentation, per-cell feature extraction, Manders colocalization analysis, QuPath-compatible GeoJSON export, and optional DICE/IoU validation using ground-truth GeoJSON annotations.
 
 The app is designed for microscopy and digital pathology workflows where images may be large, multichannel, and metadata-sensitive.
 
-> First public GitHub-ready structure. Add screenshots, example images, and Zenodo DOI after the first release.
+<p align="center">
+  <img src="assets/screenshoots/Concept.png" alt="Cell Well Segmentation concept overview" width="900">
+</p>
 
 ## Main features
 
@@ -17,8 +23,55 @@ The app is designed for microscopy and digital pathology workflows where images 
 - Per-cell measurements exported to CSV.
 - Manders colocalization metrics exported per cell and as summary JSON.
 - QuPath-compatible GeoJSON export.
+- Fast bounding-box GeoJSON export mode for improved performance on large images.
 - Resume/skip options for previously processed output folders.
 - Optional DICE/IoU validation against GeoJSON ground truth.
+
+## Graphical interface
+
+The main interface allows users to select one image or multiple images, define an output folder, inspect the loaded image thumbnail, select default or custom parameters, and run the segmentation workflow.
+
+<p align="center">
+  <img src="assets/screenshoots/MainScreen.png" alt="Main Cell Well Segmentation interface" width="900">
+</p>
+
+## Parameter exploration
+
+Before full-image processing, users can test segmentation settings on a selected region of interest. This helps tune channel mapping, nuclei detection, foreground thresholding, morphology filters, and cell-size filters before applying the parameters to large images or batch datasets.
+
+<p align="center">
+  <img src="assets/screenshoots/ParameterExploration.png" alt="Parameter exploration window" width="900">
+</p>
+
+## Batch processing
+
+Cell Well Segmentation supports bulk image processing. The processing log reports the current image, detected reader, image dimensions, interpreted channel stack, detected seeds, valid cell count, extracted features, Manders metrics, GeoJSON export progress, and preview generation.
+
+<p align="center">
+  <img src="assets/screenshoots/BulkProcessing1.png" alt="Bulk processing interface" width="900">
+</p>
+
+## Existing output handling
+
+When output folders already exist, the application lets the user decide whether to reprocess from zero, skip completed images, resume missing outputs, or cancel the run.
+
+<p align="center">
+  <img src="assets/screenshoots/ExistingOutput.png" alt="Existing output folder dialog" width="700">
+</p>
+
+Completed or partially completed outputs can be skipped or resumed. This is useful for long batch runs where some images were already processed.
+
+<p align="center">
+  <img src="assets/screenshoots/2Skipped.png" alt="Skipped completed images during batch processing" width="900">
+</p>
+
+## Finished run
+
+At the end of processing, the application summarizes successful, skipped/resumed, and failed images. A batch processing log is saved as a CSV file.
+
+<p align="center">
+  <img src="assets/screenshoots/Finish.png" alt="Finished processing summary" width="900">
+</p>
 
 ## Expected input
 
@@ -100,6 +153,7 @@ cell-well-segmentation/
 │  ├─ __init__.py
 │  ├─ __main__.py
 │  └─ app.py
+├─ assets/screenshoots/
 ├─ docs/
 │  └─ zenodo_release_checklist.md
 ├─ packaging/
@@ -119,11 +173,11 @@ cell-well-segmentation/
 
 ## Citation
 
-Use the `CITATION.cff` file in this repository. After creating the first Zenodo release, replace the placeholder DOI in `CITATION.cff`, `.zenodo.json`, and this README.
+If you use **Cell Well Segmentation**, please cite:
 
-Suggested plain-text citation after DOI generation:
+> Rodriguez Rojas JJ. Cell Well Segmentation: Immunofluorescence Cell Segmentation, Quantification and Validation. Version 1.0.0. Zenodo. 2026. doi: 10.5281/zenodo.20387083.
 
-> Rodriguez Rojas JJ. Cell Well Segmentation: Immunofluorescence Cell Segmentation, Quantification and Validation. Version 1.0.0. Zenodo. 2026. doi: ADD_DOI_HERE.
+DOI: [10.5281/zenodo.20387083](https://doi.org/10.5281/zenodo.20387083)
 
 ## License
 

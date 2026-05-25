@@ -3054,22 +3054,39 @@ class CellWellSegmentationGUI(QMainWindow):
         help_menu.addAction(about_action)
 
     def show_help_about(self):
-        """
-        Placeholder Help/About dialog.
-
-        Fill this text later with:
-          - app description
-          - citation
-          - DOI / GitHub
-          - channel mapping explanation
-          - output file descriptions
-          - recommended parameters
-        """
+        """Show application information, citation, DOI and output summary."""
         msg = (
-            f"{APP_NAME} v{APP_VERSION}\\n\\n"
-            "Help/About placeholder.\\n\\n"
-            "You can fill this section later with the final description, citation, "
-            "parameter notes, supported formats, and output explanations."
+            f"{APP_NAME} v{APP_VERSION}\n\n"
+            "Immunofluorescence Cell Segmentation, Quantification and Validation\n\n"
+            "Cell Well Segmentation is a desktop GUI tool for microscopy image "
+            "cell segmentation, cell-level feature extraction, Manders colocalization "
+            "analysis, QuPath-compatible GeoJSON export, and optional DICE-based "
+            "validation against ground-truth GeoJSON annotations.\n\n"
+            "Main workflow:\n"
+            "1. Select one image or bulk microscopy images.\n"
+            "2. Review the image thumbnail and choose Default or Custom parameters.\n"
+            "3. Optionally use Parameter Exploration on a selected ROI.\n"
+            "4. Run segmentation and quantification.\n"
+            "5. Export masks, CSV features, Manders metrics, preview images, GeoJSON, "
+            "and optional validation reports.\n\n"
+            "Main outputs per image:\n"
+            "- instances.tif: instance segmentation mask.\n"
+            "- cell_features.csv: cell-level morphology and intensity features.\n"
+            "- manders_features.csv: cell-level Manders colocalization metrics.\n"
+            "- cell_features_with_manders.csv: merged feature table.\n"
+            "- manders_summary.json: threshold and colocalization summary.\n"
+            "- qupath_final.geojson: QuPath-compatible cell annotations.\n"
+            "- preview.png: visual quality-control summary.\n"
+            "- validation/: optional DICE/IoU reports when ground-truth GeoJSON is used.\n\n"
+            "Citation:\n"
+            "Rodriguez Rojas JJ. Cell Well Segmentation: Immunofluorescence Cell "
+            "Segmentation, Quantification and Validation. Version 1.0.0. Zenodo. "
+            "2026. doi: 10.5281/zenodo.20387083.\n\n"
+            "DOI: 10.5281/zenodo.20387083\n"
+            "Zenodo badge: https://zenodo.org/badge/1149252759.svg\n"
+            "GitHub: https://github.com/Juaco2r/cell-well-segmentation\n\n"
+            f"Author: {APP_AUTHOR}\n"
+            f"Year: {APP_YEAR}"
         )
         QMessageBox.information(self, "Help / About", msg)
 

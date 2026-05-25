@@ -29,7 +29,7 @@ from skimage import filters, segmentation, morphology, measure, feature
 from skimage.measure import regionprops_table
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRect, QPoint
-from PyQt5.QtGui import QPixmap, QImage, QFont, QPainter, QPen, QColor
+from PyQt5.QtGui import QPixmap, QImage, QFont, QPainter, QPen, QColor, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFileDialog,
     QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QComboBox, QSpinBox,
@@ -109,6 +109,63 @@ APP_VERSION = "1.0.0"
 APP_TITLE = "Cell Well Segmentation: Immunofluorescence Cell Segmentation, Quantification and Validation"
 APP_AUTHOR = "José J. Rodriguez Rojas"
 APP_YEAR = "2026"
+
+
+# ============================================================
+# Application icon / bundled resource helpers
+# ============================================================
+
+def resource_path(relative_path: str) -> str:
+    """
+    Return an absolute path to a bundled resource.
+
+    Works when running:
+      - directly from source code
+      - as a PyInstaller onefile/onedir executable
+
+    Expected project location when running from source:
+      project_root/
+        assets/icons/cell_well_segmentation_icon_option1.ico
+        src/cell_well_segmentation/app.py
+    """
+    relative_path = str(relative_path).replace("\\", "/")
+
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base_path = Path(sys._MEIPASS)
+    else:
+        # app.py is usually in src/cell_well_segmentation/
+        # parents[2] should be the project root.
+        try:
+            base_path = Path(__file__).resolve().parents[2]
+        except Exception:
+            base_path = Path.cwd()
+
+    return str(base_path / relative_path)
+
+
+def get_app_icon() -> QIcon:
+    """
+    Load the application icon.
+
+    The .ico file is preferred on Windows and for PyInstaller builds.
+    The .png fallback is useful during development or on macOS/Linux.
+    """
+    icon_candidates = [
+        "assets/icons/cell_well_segmentation_icon_option1.ico",
+        "assets/icons/cell_well_segmentation_icon_option1.png",
+        "assets/icon/cell_well_segmentation_icon_option1.ico",
+        "assets/icon/cell_well_segmentation_icon_option1.png",
+    ]
+
+    icon = QIcon()
+    for rel_path in icon_candidates:
+        full_path = Path(resource_path(rel_path))
+        if full_path.exists() and full_path.is_file():
+            icon = QIcon(str(full_path))
+            if not icon.isNull():
+                return icon
+
+    return icon
 
 
 # ============================================================
@@ -2783,6 +2840,7 @@ class ParameterExplorationDialog(QDialog):
     """Interactive ROI-based parameter exploration window."""
     def __init__(self, image_path, start_params: PipelineParams, parent=None):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.setWindowTitle("Parameter Exploration")
         self.resize(1180, 900)
         self.image_path = Path(image_path)
@@ -3036,6 +3094,7 @@ class ParameterExplorationDialog(QDialog):
 class CellWellSegmentationGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.setWindowIcon(get_app_icon())
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - {APP_TITLE}")
         self.resize(1320, 840)
         self.paths = []
@@ -3676,6 +3735,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
+    app.setWindowIcon(get_app_icon())
     app.setStyle("Fusion")
     window = CellWellSegmentationGUI()
     window.show()

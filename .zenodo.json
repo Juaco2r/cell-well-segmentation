@@ -1,0 +1,31 @@
+{
+  "title": "Cell Well Segmentation: Immunofluorescence Cell Segmentation, Quantification and Validation",
+  "upload_type": "software",
+  "description": "Cell Well Segmentation is a desktop GUI for immunofluorescence cell segmentation, per-cell feature extraction, Manders colocalization analysis, QuPath-compatible GeoJSON export, and optional DICE/IoU validation using ground-truth GeoJSON annotations.",
+  "creators": [
+    {
+      "name": "Rodriguez Rojas, José J.",
+      "affiliation": "Universitat de Barcelona"
+    }
+  ],
+  "license": "MIT",
+  "keywords": [
+    "digital pathology",
+    "immunofluorescence",
+    "cell segmentation",
+    "QuPath",
+    "GeoJSON",
+    "Manders",
+    "DICE"
+  ],
+  "version": "1.0.0",
+  "publication_date": "2026-05-26",
+  "access_right": "open",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/Juaco2r/cell-well-segmentation",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}

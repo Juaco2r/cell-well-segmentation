@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "Cell Well Segmentation: Immunofluorescence Cell Segmentation, Quantification and Validation"
+version: "1.0.0"
+doi: "ADD_ZENODO_DOI_HERE"
+date-released: "2026-05-26"
+type: software
+authors:
+  - family-names: "Rodriguez Rojas"
+    given-names: "José J."
+repository-code: "https://github.com/Juaco2r/cell-well-segmentation"
+license: "MIT"
+keywords:
+  - digital pathology
+  - immunofluorescence
+  - cell segmentation
+  - QuPath
+  - GeoJSON
+  - Manders colocalization
+  - DICE validation
+abstract: >-
+  Cell Well Segmentation is a desktop application for immunofluorescence cell segmentation,
+  per-cell feature extraction, Manders colocalization analysis, QuPath-compatible GeoJSON
+  export, and optional DICE/IoU validation against ground-truth GeoJSON annotations.

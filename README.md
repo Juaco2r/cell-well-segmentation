@@ -1,215 +1,135 @@
-# Cell Well Segmentation and Feature Extraction
+# Cell Well Segmentation
 
-Classical computer vision pipeline for **instance segmentation and feature extraction of low-density cell wells** from multi-channel fluorescence microscopy images.
+**Cell Well Segmentation** is a Python/PyQt5 desktop application for immunofluorescence cell segmentation, per-cell feature extraction, Manders colocalization analysis, QuPath-compatible GeoJSON export, and optional DICE/IoU validation using ground-truth GeoJSON annotations.
 
-This repository implements a **fully reproducible, non–deep learning workflow** that produces segmentation masks, per-cell quantitative features, QuPath-compatible annotations, and visualization previews, with an emphasis on robustness, clarity, and memory management.
+The app is designed for microscopy and digital pathology workflows where images may be large, multichannel, and metadata-sensitive.
 
----
+> First public GitHub-ready structure. Add screenshots, example images, and Zenodo DOI after the first release.
 
-## Key Features
+## Main features
 
-- Multi-channel TIFF image handling  
-- Nuclei-based seed detection  
-- Marker-controlled watershed instance segmentation  
-- Morphological and intensity feature extraction  
-- CSV export of per-cell features  
-- GeoJSON annotations compatible with **QuPath**  
-- Visualization previews for quality control  
-- Designed for **low-density cell wells**  
-- No machine learning or deep learning dependencies  
+- GUI-based single-image and bulk-image processing.
+- Multichannel TIFF/OME-TIFF support through `tifffile`.
+- WSI-style format support through OpenSlide when available, including SVS, NDPI, MRXS, SCN, VMS/VMU, BIF, SVSLIDE, and DICOM-like slide files.
+- RGB fallback for standard PNG/JPEG/RGB images.
+- ROI-based parameter exploration before full-image processing.
+- Instance segmentation using nuclei seeding and watershed over cytoplasmic foreground.
+- Per-cell measurements exported to CSV.
+- Manders colocalization metrics exported per cell and as summary JSON.
+- QuPath-compatible GeoJSON export.
+- Resume/skip options for previously processed output folders.
+- Optional DICE/IoU validation against GeoJSON ground truth.
 
----
+## Expected input
 
-## Repository Structure
+The default channel mapping is:
 
-```
-cell-well-segmentation/
-│
-├── README.md
-├── requirements.txt
-├── pyproject.toml
-├── .gitignore
-│
-├── data/
-│   ├── README.md
-│   └── example/
-│       ├── README.md
-│       └── D1_CropMini.tif
-│
-├── src/
-│   └── cellwell/
-│       ├── __init__.py
-│       ├── pipeline.py
-│       └── cli.py
-│
-├── tests/
-│   └── test_code.py
-│
-└── docs/
-```
+| Parameter | Default channel index | Purpose |
+|---|---:|---|
+| Nuclei channel | 0 | Nuclei / seed detection |
+| Red channel | 1 | Red biological signal |
+| Green channel | 2 | Green biological signal |
+| Cyto channel | 3 | Cytoplasmic / foreground segmentation signal |
 
----
+Use **Custom** parameters if your images have a different channel order.
 
-## Input Data Format
+## Main outputs
 
-**Input:** multi-channel fluorescence microscopy images stored as TIFF files (`.tif` or `.tiff`).
+For every processed image, the app creates one output folder named after the image stem. Main files include:
 
-Each input image is processed independently and generates a corresponding output folder.
+| Output | Description |
+|---|---|
+| `instances.tif` | Labeled instance mask; each segmented cell has a unique integer label. |
+| `cell_features.csv` | Per-cell morphology and intensity features. |
+| `manders_features.csv` | Per-cell Manders colocalization metrics. |
+| `cell_features_with_manders.csv` | Combined features and Manders metrics. |
+| `manders_summary.json` | Summary thresholds and processing metadata for Manders analysis. |
+| `RGB.tif` | RGB composite from selected channels. |
+| `CellCyto.tif` | Composite used for segmentation preview/processing. |
+| `qupath_final.geojson` | QuPath-compatible segmentation polygons. |
+| `preview.png` | Visual QC summary. |
+| `validation/dice_report.csv` | Optional validation report when ground-truth GeoJSON is provided. |
 
-### Channel Convention
-
-The pipeline assumes the following channel order:
-
-| Channel index | Description |
-|--------------|------------|
-| 0 | Nuclear stain (e.g. DAPI, blue) |
-| 1 | Marker channel (red) |
-| 2 | Marker channel (green) |
-| 3 | Cytoplasmic stain (CellCyto) |
-
-⚠️ **Important:**  
-If your data uses a different channel order, the channel mapping must be updated in `create_channel_images()` within `pipeline.py`.
-
----
-
-## Installation
-
-Clone the repository and install dependencies:
+## Installation from source
 
 ```bash
-git clone https://github.com/<username>/cell-well-segmentation.git
+git clone https://github.com/Juaco2r/cell-well-segmentation.git
 cd cell-well-segmentation
+python -m venv .venv
+.venv\Scripts\activate  # Windows
 pip install -r requirements.txt
+python -m cell_well_segmentation
 ```
 
-Install the project in editable mode (required for the `src/` layout):
+On macOS/Linux:
 
 ```bash
-pip install -e .
-```
-
-**Requirements**
-- Python ≥ 3.9  
-- Tested on Windows and Linux  
-
----
-
-## Running the Pipeline (Recommended)
-
-The pipeline is executed via a **command-line interface (CLI)**.
-
-### Run on the provided example data
-
-```bash
-python -m cellwell.cli --input "data/example/D1_CropMini.tif"
-```
-
-### Run on your own data
-
-```bash
-python -m cellwell.cli --input "path/to/your/data/*.tif"
-```
-
-For each input file, an output folder is created automatically.
-
----
-
-## Output Files
-
-For each processed image, the following files are generated:
-
-- **`RGB.tif`**  
-  RGB composite image created from selected channels.
-
-- **`CellCyto.tif`**  
-  Composite image highlighting cytoplasmic and nuclear signals, used for segmentation.
-
-- **`instances.tif`**  
-  Instance-labeled segmentation mask (`uint16`), where each cell has a unique label.
-
-- **`cell_features.csv`**  
-  Per-cell quantitative features, including:
-  - area and perimeter  
-  - per-channel mean, max, median, standard deviation  
-  - coefficient of variation (CV)  
-  - integrated intensity per channel  
-  - centroid coordinates  
-
-- **`qupath_final.geojson`**  
-  Polygon annotations compatible with **QuPath**, enabling visualization and manual inspection.
-
-- **`preview.png`**  
-  Downsampled visualization summarizing nuclei detection, segmentation, and final instances.
-
----
-
-## Testing and Reproducibility
-
-Minimal automated tests are provided using **pytest**.
-
-Run tests from the repository root:
-
-```bash
-python -m pytest
-```
-
-Tests verify:
-- correct package installation
-- successful imports
-- end-to-end execution on example data
-
-⚠️ Tests must be run via `pytest`.  
-Direct execution of test files (e.g. `python test_code.py`) is not supported when using a `src/` layout.
-
----
-
-## Notebook Usage (Optional)
-
-Interactive demonstrations may be provided as Jupyter notebooks.
-
-⚠️ Important
-Notebooks must be executed using the same Python environment used for the CLI.
-
-If you encounter errors such as ModuleNotFoundError, ensure that:
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-pip install -e .
-have been run in the active notebook kernel.
+python -m cell_well_segmentation
+```
 
----
+## OpenSlide support
 
-## Method Summary
+For WSI formats such as SVS and NDPI, install OpenSlide support:
 
-The segmentation pipeline consists of:
+```bash
+pip install openslide-python openslide-bin
+```
 
-1. Gaussian smoothing of the nuclear channel  
-2. Local maxima detection for seed generation  
-3. Adaptive foreground detection using Otsu thresholding  
-4. Marker-controlled watershed segmentation  
-5. Post-segmentation filtering based on object area  
+If OpenSlide is unavailable, TIFF/OME-TIFF and standard raster images can still work through `tifffile` and Pillow.
 
-Feature extraction is performed on the original-resolution RGB data to preserve intensity fidelity.
+## Windows executable build
 
----
+Install development dependencies and run the packaging helper:
 
-## Notes and Limitations
+```bash
+pip install -r requirements.txt
+pip install pyinstaller
+packaging\build_windows.bat
+```
 
-- Optimized for **low-density cell wells**
-- Parameters may require tuning for different magnifications or staining conditions
-- Not designed for highly confluent or overlapping cells
-- No machine learning or deep learning models are used
+The executable will be created under `dist/`.
 
----
+## Recommended repository structure
+
+```text
+cell-well-segmentation/
+├─ src/cell_well_segmentation/
+│  ├─ __init__.py
+│  ├─ __main__.py
+│  └─ app.py
+├─ docs/
+│  └─ zenodo_release_checklist.md
+├─ packaging/
+│  ├─ CellWellSegmentation.spec
+│  └─ build_windows.bat
+├─ .github/workflows/python-check.yml
+├─ .gitignore
+├─ CITATION.cff
+├─ LICENSE
+├─ README.md
+├─ requirements.txt
+├─ pyproject.toml
+├─ CHANGELOG.md
+├─ CONTRIBUTING.md
+└─ .zenodo.json
+```
+
+## Citation
+
+Use the `CITATION.cff` file in this repository. After creating the first Zenodo release, replace the placeholder DOI in `CITATION.cff`, `.zenodo.json`, and this README.
+
+Suggested plain-text citation after DOI generation:
+
+> Rodriguez Rojas JJ. Cell Well Segmentation: Immunofluorescence Cell Segmentation, Quantification and Validation. Version 1.0.0. Zenodo. 2026. doi: ADD_DOI_HERE.
 
 ## License
 
-This project is released under the **MIT License**.
+This project is released under the MIT License. See `LICENSE`.
 
----
+## Author
 
-## Contact
-
-For questions, suggestions, or issues, please open an issue on GitHub or contact:
-
-**Jose J. Rodriguez Rojas**  
-📧 juaco2r@gmail.com
-
+José J. Rodriguez Rojas  
+PhD Candidate, Universitat de Barcelona

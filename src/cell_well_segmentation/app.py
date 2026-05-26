@@ -28,7 +28,7 @@ from scipy import ndimage
 from skimage import filters, segmentation, morphology, measure, feature
 from skimage.measure import regionprops_table
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRect, QPoint
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRect, QPoint, QProcess
 from PyQt5.QtGui import QPixmap, QImage, QFont, QPainter, QPen, QColor, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFileDialog,
@@ -1416,9 +1416,9 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
     # red_positive/green_positive when its mean channel intensity is greater than
     # or equal to the user-defined biological threshold. double_positive means
     # both red_positive and green_positive are True.
-    df["red_positive"] = df["red_mean"] >= float(params.biological_red_threshold)
-    df["green_positive"] = df["green_mean"] >= float(params.biological_green_threshold)
-    df["double_positive"] = df["red_positive"] & df["green_positive"]
+    df["red_positive"] = (df["red_mean"] >= float(params.biological_red_threshold)).astype(int)
+    df["green_positive"] = (df["green_mean"] >= float(params.biological_green_threshold)).astype(int)
+    df["double_positive"] = ((df["red_positive"] == 1) & (df["green_positive"] == 1)).astype(int)
 
     before_filter = len(df)
     df = df[
@@ -1522,18 +1522,8 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
             params.biological_green_threshold,
         )
 
-        red_mean = float(np.mean(red_vals))
-        green_mean = float(np.mean(green_vals))
-        red_positive = bool(red_mean >= float(params.biological_red_threshold))
-        green_positive = bool(green_mean >= float(params.biological_green_threshold))
-
         rows.append({
             "label": int(label),
-            "red_mean_for_positivity": red_mean,
-            "green_mean_for_positivity": green_mean,
-            "red_positive": red_positive,
-            "green_positive": green_positive,
-            "double_positive": bool(red_positive and green_positive),
             "global_red_threshold": float(global_red_thr),
             "global_green_threshold": float(global_green_thr),
             "cell_otsu_red_threshold": float(cell_red_thr),
@@ -1563,9 +1553,9 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
     df_manders = pd.DataFrame(rows)
     summary = {
         "n_cells_processed": int(len(df_manders)),
-        "n_red_positive": int(df_manders["red_positive"].sum()) if "red_positive" in df_manders.columns else 0,
-        "n_green_positive": int(df_manders["green_positive"].sum()) if "green_positive" in df_manders.columns else 0,
-        "n_double_positive": int(df_manders["double_positive"].sum()) if "double_positive" in df_manders.columns else 0,
+        "n_red_positive": int(df_features["red_positive"].sum()) if df_features is not None and "red_positive" in df_features.columns else 0,
+        "n_green_positive": int(df_features["green_positive"].sum()) if df_features is not None and "green_positive" in df_features.columns else 0,
+        "n_double_positive": int(df_features["double_positive"].sum()) if df_features is not None and "double_positive" in df_features.columns else 0,
         "global_red_threshold": float(global_red_thr),
         "global_green_threshold": float(global_green_thr),
         "biological_red_threshold": float(params.biological_red_threshold),
@@ -1606,7 +1596,19 @@ def compute_and_save_manders(instance_labels, rgb_stack_hwc, df_features, output
     manders_csv_path = output_folder / "manders_features.csv"
     df_manders.to_csv(manders_csv_path, index=False)
 
-    df_merged = df_features.merge(df_manders, on="label", how="left")
+    # Avoid duplicated pandas merge suffixes such as red_positive_x/red_positive_y.
+    # Positivity is a cell-level feature and is stored only once in cell_features.csv
+    # and in the merged cell_features_with_manders.csv.
+    duplicate_cell_feature_cols = [
+        "red_positive",
+        "green_positive",
+        "double_positive",
+        "red_mean_for_positivity",
+        "green_mean_for_positivity",
+    ]
+    df_manders_for_merge = df_manders.drop(columns=duplicate_cell_feature_cols, errors="ignore")
+
+    df_merged = df_features.merge(df_manders_for_merge, on="label", how="left")
     merged_csv_path = output_folder / "cell_features_with_manders.csv"
     df_merged.to_csv(merged_csv_path, index=False)
 
@@ -3312,28 +3314,71 @@ class CellWellSegmentationGUI(QMainWindow):
 
 
     def _build_menu_bar(self):
-        """Top menu with a Help/About placeholder that you can fill later."""
+        """Top menu with application actions and Help/About."""
+        app_menu = self.menuBar().addMenu("App")
+
+        restart_action = QAction("Restart application", self)
+        restart_action.triggered.connect(self.restart_application)
+        app_menu.addAction(restart_action)
+
+        app_menu.addSeparator()
+
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        app_menu.addAction(exit_action)
+
         help_menu = self.menuBar().addMenu("Help / About")
         about_action = QAction("Help / About", self)
         about_action.triggered.connect(self.show_help_about)
         help_menu.addAction(about_action)
 
+    def restart_application(self):
+        """Restart the app safely from source or from a PyInstaller executable."""
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.warning(
+                self,
+                "Processing is running",
+                "Please wait until processing finishes before restarting the application.",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Restart application",
+            "Restart Cell Well Segmentation now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        QApplication.processEvents()
+
+        if getattr(sys, "frozen", False):
+            program = sys.executable
+            args = sys.argv[1:]
+        else:
+            program = sys.executable
+            args = sys.argv
+
+        QProcess.startDetached(program, args)
+        QApplication.quit()
+
     def show_help_about(self):
-        """Show application information, citation, DOI and output summary."""
+        """Show application information, citation, DOI and output summary in a wider dialog."""
         msg = (
             f"{APP_NAME} v{APP_VERSION}\n\n"
             "Immunofluorescence Cell Segmentation, Quantification and Validation\n\n"
-            "Cell Well Segmentation is a desktop GUI tool for microscopy image "
-            "cell segmentation, cell-level feature extraction, Manders colocalization "
-            "analysis, QuPath-compatible GeoJSON export, and optional DICE-based "
-            "validation against ground-truth GeoJSON annotations.\n\n"
+            "Cell Well Segmentation is a desktop GUI tool for microscopy image cell segmentation, "
+            "cell-level feature extraction, Manders colocalization analysis, QuPath-compatible "
+            "GeoJSON export, and optional DICE-based validation against ground-truth GeoJSON annotations.\n\n"
             "Main workflow:\n"
             "1. Select one image or bulk microscopy images.\n"
             "2. Review the image thumbnail and choose Default or Custom parameters.\n"
             "3. Optionally use Parameter Exploration on a selected ROI.\n"
-            "4. Run segmentation and quantification.\n"
-            "5. Export masks, CSV features, Manders metrics, preview images, GeoJSON, "
-            "and optional validation reports.\n\n"
+            "4. Optional: select a ground-truth GeoJSON in Parameter Exploration to calculate ROI DICE/IoU while tuning.\n"
+            "5. Run segmentation and quantification.\n"
+            "6. Export masks, CSV features, Manders metrics, preview images, GeoJSON, and optional validation reports.\n\n"
             "Main outputs per image:\n"
             "- instances.tif: instance segmentation mask.\n"
             "- cell_features.csv: cell-level morphology and intensity features.\n"
@@ -3343,17 +3388,47 @@ class CellWellSegmentationGUI(QMainWindow):
             "- qupath_final.geojson: QuPath-compatible cell annotations.\n"
             "- preview.png: visual quality-control summary.\n"
             "- validation/: optional DICE/IoU reports when ground-truth GeoJSON is used.\n\n"
+            "Feature table notes:\n"
+            "- red_positive, green_positive and double_positive are 0/1 biological positivity flags.\n"
+            "- These flags are based on mean red/green cell intensity and the user-defined biological thresholds.\n"
+            "- They do not change segmentation or remove cells from the main feature table.\n\n"
+            "Manders notes:\n"
+            "- Manders red-in-green and green-in-red are asymmetric coefficients and can differ.\n"
+            "- Global, per-cell Otsu and biological-threshold variants are exported for reproducibility.\n\n"
             "Citation:\n"
-            "Rodriguez Rojas JJ. Cell Well Segmentation: Immunofluorescence Cell "
-            "Segmentation, Quantification and Validation. Version 1.0.0. Zenodo. "
-            "2026. doi: 10.5281/zenodo.20387083.\n\n"
+            "Rodriguez Rojas JJ. Cell Well Segmentation: Immunofluorescence Cell Segmentation, "
+            "Quantification and Validation. Version 1.0.0. Zenodo. 2026. doi: 10.5281/zenodo.20387083.\n\n"
             "DOI: 10.5281/zenodo.20387083\n"
             "Zenodo badge: https://zenodo.org/badge/1149252759.svg\n"
             "GitHub: https://github.com/Juaco2r/cell-well-segmentation\n\n"
             f"Author: {APP_AUTHOR}\n"
             f"Year: {APP_YEAR}"
         )
-        QMessageBox.information(self, "Help / About", msg)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Help / About")
+        dialog.setWindowIcon(get_app_icon())
+        dialog.resize(760, 720)
+
+        layout = QVBoxLayout(dialog)
+
+        title = QLabel(f"{APP_NAME} v{APP_VERSION}")
+        title.setFont(QFont("Arial", 14, QFont.Bold))
+        title.setStyleSheet("color: #2c3e50; margin-bottom: 6px;")
+        layout.addWidget(title)
+
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(msg)
+        text.setMinimumWidth(700)
+        text.setStyleSheet("background: white; color: #111; font-family: Arial; font-size: 10.5pt;")
+        layout.addWidget(text, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        dialog.exec_()
 
     def _build_ui(self):
         central = QWidget()
@@ -3950,3 +4025,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

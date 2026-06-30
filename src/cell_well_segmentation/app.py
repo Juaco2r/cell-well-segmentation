@@ -1,8 +1,3 @@
-"""Cell Well Segmentation main GUI application.
-
-This file is intentionally kept as a mostly single-file application so it can
-be run directly during development and packaged with PyInstaller.
-"""
 
 import os
 import sys
@@ -10,6 +5,7 @@ import gc
 import csv
 import json
 import math
+import re
 import uuid
 import traceback
 from dataclasses import dataclass, asdict
@@ -991,6 +987,11 @@ class PipelineParams:
     biological_red_threshold: float = 7000.0
     biological_green_threshold: float = 3500.0
 
+    # Biological marker labels used in output column aliases and summaries.
+    # The raw channel columns remain red/green for backwards compatibility.
+    red_marker_name: str = "aSMA"
+    green_marker_name: str = "MYH11"
+
     preview_downsample_factor: int = 4
     preview_dpi: int = 200
     max_full_read_pixels: int = 250_000_000
@@ -998,6 +999,7 @@ class PipelineParams:
     save_intermediate_rgb_cellcyto: bool = True
     save_geojson: bool = True
     save_preview: bool = True
+    include_additional_feature_figures: bool = False
 
     # ------------------------------------------------------------
     # Existing output behavior
@@ -1339,6 +1341,69 @@ def run_segmentation_from_cellcyto(cellcyto_stack_hwc, output_folder, params: Pi
 # Feature extraction
 # ============================================================
 
+def _safe_divide(numerator, denominator):
+    """Return numerator / denominator as float; return NaN for zero/invalid denominators."""
+    try:
+        denominator = float(denominator)
+        if denominator == 0 or not np.isfinite(denominator):
+            return np.nan
+        return float(numerator) / denominator
+    except Exception:
+        return np.nan
+
+
+def _safe_pearson(x, y):
+    """Pearson correlation that returns NaN for too few pixels or constant vectors."""
+    try:
+        x = np.asarray(x, dtype=np.float64).ravel()
+        y = np.asarray(y, dtype=np.float64).ravel()
+        finite = np.isfinite(x) & np.isfinite(y)
+        x = x[finite]
+        y = y[finite]
+        if x.size < 2 or y.size < 2:
+            return np.nan
+        if np.std(x) == 0 or np.std(y) == 0:
+            return np.nan
+        return float(np.corrcoef(x, y)[0, 1])
+    except Exception:
+        return np.nan
+
+
+def _marker_token(name):
+    """Convert a marker name such as 'aSMA / ACTA2' into a CSV-safe token."""
+    token = re.sub(r"[^0-9A-Za-z]+", "_", str(name or "marker")).strip("_")
+    return token or "marker"
+
+
+def _add_marker_alias_columns(df, params: PipelineParams):
+    """Add aSMA/MYH11-style aliases while keeping red/green columns unchanged."""
+    if df is None or df.empty:
+        return df
+
+    red_name = _marker_token(getattr(params, "red_marker_name", "aSMA"))
+    green_name = _marker_token(getattr(params, "green_marker_name", "MYH11"))
+    pair_name = f"{red_name}_{green_name}"
+
+    alias_map = {
+        f"{red_name}_positive": "red_positive",
+        f"{green_name}_positive": "green_positive",
+        f"{pair_name}_double_positive": "double_positive",
+        f"{red_name}_positive_area_px": "red_positive_area_px",
+        f"{green_name}_positive_area_px": "green_positive_area_px",
+        f"{pair_name}_double_positive_area_px": "double_positive_area_px",
+        f"{pair_name}_union_positive_area_px": "union_positive_area_px",
+        f"{red_name}_area_overlapping_{green_name}_fraction": "red_area_overlap_fraction",
+        f"{green_name}_area_overlapping_{red_name}_fraction": "green_area_overlap_fraction",
+        f"{pair_name}_overlap_jaccard_pixels": "overlap_jaccard_pixels",
+    }
+
+    for alias, source in alias_map.items():
+        if source in df.columns and alias not in df.columns:
+            df[alias] = df[source]
+
+    return df
+
+
 def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: PipelineParams, log=print):
     log("Extracting cell features...")
 
@@ -1366,10 +1431,15 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
             "red_max", "red_mean", "green_max", "green_mean", "blue_max", "blue_mean",
             "centroid_y", "centroid_x",
             "red_positive", "green_positive", "double_positive",
+            "red_positive_area_px", "green_positive_area_px", "double_positive_area_px",
+            "union_positive_area_px", "red_only_area_px", "green_only_area_px",
+            "red_positive_area_fraction_cell", "green_positive_area_fraction_cell",
+            "double_positive_area_fraction_cell", "overlap_jaccard_pixels",
+            "red_area_overlap_fraction", "green_area_overlap_fraction",
+            "red_positive_integrated_intensity", "green_positive_integrated_intensity",
+            "red_intensity_in_green_positive_area", "green_intensity_in_red_positive_area",
         ])
-        csv_path = Path(output_folder) / "cell_features.csv"
-        df.to_csv(csv_path, index=False)
-        log("  No cells found. Empty cell_features.csv saved.")
+        log("  No cells found. Empty feature table will be carried forward to cell_features_with_manders.csv.")
         return df
 
     props_red = regionprops_table(instance_labels, intensity_image=red, properties=["label", "max_intensity", "mean_intensity"])
@@ -1400,6 +1470,43 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
             df.at[idx, f"{prefix}_p25"] = float(np.percentile(vals, 25))
             df.at[idx, f"{prefix}_p75"] = float(np.percentile(vals, 75))
 
+        # Pixel-level biological overlap inside each segmented cell.
+        # These use the user-defined biological thresholds and are therefore
+        # directly interpretable as aSMA/MYH11 positive area when red=aSMA and
+        # green=MYH11. They complement Manders, which is intensity-weighted.
+        red_vals_cell = red[mask].ravel().astype(np.float64, copy=False)
+        green_vals_cell = green[mask].ravel().astype(np.float64, copy=False)
+        n_cell_px = int(red_vals_cell.size)
+
+        red_pos_px_mask = red_vals_cell >= float(params.biological_red_threshold)
+        green_pos_px_mask = green_vals_cell >= float(params.biological_green_threshold)
+        both_pos_px_mask = red_pos_px_mask & green_pos_px_mask
+        union_pos_px_mask = red_pos_px_mask | green_pos_px_mask
+
+        red_area_px = int(red_pos_px_mask.sum())
+        green_area_px = int(green_pos_px_mask.sum())
+        double_area_px = int(both_pos_px_mask.sum())
+        union_area_px = int(union_pos_px_mask.sum())
+
+        df.at[idx, "red_positive_area_px"] = red_area_px
+        df.at[idx, "green_positive_area_px"] = green_area_px
+        df.at[idx, "double_positive_area_px"] = double_area_px
+        df.at[idx, "union_positive_area_px"] = union_area_px
+        df.at[idx, "red_only_area_px"] = int((red_pos_px_mask & ~green_pos_px_mask).sum())
+        df.at[idx, "green_only_area_px"] = int((green_pos_px_mask & ~red_pos_px_mask).sum())
+        df.at[idx, "red_positive_area_fraction_cell"] = _safe_divide(red_area_px, n_cell_px)
+        df.at[idx, "green_positive_area_fraction_cell"] = _safe_divide(green_area_px, n_cell_px)
+        df.at[idx, "double_positive_area_fraction_cell"] = _safe_divide(double_area_px, n_cell_px)
+        df.at[idx, "overlap_jaccard_pixels"] = _safe_divide(double_area_px, union_area_px)
+        df.at[idx, "red_area_overlap_fraction"] = _safe_divide(double_area_px, red_area_px)
+        df.at[idx, "green_area_overlap_fraction"] = _safe_divide(double_area_px, green_area_px)
+        df.at[idx, "red_positive_integrated_intensity"] = float(red_vals_cell[red_pos_px_mask].sum())
+        df.at[idx, "green_positive_integrated_intensity"] = float(green_vals_cell[green_pos_px_mask].sum())
+        df.at[idx, "red_intensity_in_green_positive_area"] = float(red_vals_cell[green_pos_px_mask].sum())
+        df.at[idx, "green_intensity_in_red_positive_area"] = float(green_vals_cell[red_pos_px_mask].sum())
+        df.at[idx, "red_mean_positive_pixels"] = float(np.mean(red_vals_cell[red_pos_px_mask])) if red_area_px > 0 else np.nan
+        df.at[idx, "green_mean_positive_pixels"] = float(np.mean(green_vals_cell[green_pos_px_mask])) if green_area_px > 0 else np.nan
+
     df["seg_intensity"] = df["green_mean"]
     df["red_cv"] = df["red_std"] / (df["red_mean"] + 1e-6)
     df["green_cv"] = df["green_std"] / (df["green_mean"] + 1e-6)
@@ -1427,11 +1534,10 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
     ].reset_index(drop=True)
     after_filter = len(df)
 
-    csv_path = Path(output_folder) / "cell_features.csv"
-    df.to_csv(csv_path, index=False)
+    df = _add_marker_alias_columns(df, params)
 
     log(f"  Feature cells: {before_filter} -> {after_filter}")
-    log(f"  Saved: {csv_path.name}")
+    log("  Cell feature table will be saved only after Manders metrics are merged.")
 
     return df
 
@@ -1451,15 +1557,43 @@ def safe_otsu(values):
     return float(filters.threshold_otsu(values))
 
 
-def get_global_thresholds(red, green):
-    red_nonzero = red[red > 0]
-    green_nonzero = green[green > 0]
-    red_thr = safe_otsu(red_nonzero) if red_nonzero.size > 0 else 0.0
-    green_thr = safe_otsu(green_nonzero) if green_nonzero.size > 0 else 0.0
+def get_global_thresholds(red, green, analysis_mask=None):
+    """Calculate image-level Otsu thresholds inside segmented/analysis areas.
+
+    The threshold is computed independently for each channel using non-zero
+    pixels restricted to the segmented cell mask used for analysis. This avoids
+    allowing the full-image background to dominate the automatic Otsu threshold.
+    These values are used only for the `manders_global_*` metrics. Biological
+    positivity flags and biological overlap metrics use
+    `biological_red_threshold` and `biological_green_threshold` instead.
+    """
+    red = np.asarray(red)
+    green = np.asarray(green)
+
+    if analysis_mask is None:
+        analysis_mask = np.ones(red.shape, dtype=bool)
+    else:
+        analysis_mask = np.asarray(analysis_mask, dtype=bool)
+        if analysis_mask.shape != red.shape:
+            raise ValueError(f"analysis_mask shape {analysis_mask.shape} does not match image shape {red.shape}")
+
+    red_values = red[analysis_mask & (red > 0)]
+    green_values = green[analysis_mask & (green > 0)]
+    red_thr = safe_otsu(red_values) if red_values.size > 0 else 0.0
+    green_thr = safe_otsu(green_values) if green_values.size > 0 else 0.0
     return float(red_thr), float(green_thr)
 
 
 def compute_manders(red_vals, green_vals, red_thr, green_thr):
+    """Compute asymmetric Manders and complementary pixel-overlap metrics.
+
+    Existing columns are preserved:
+      - manders_red_in_green: red intensity fraction located in green-positive pixels.
+      - manders_green_in_red: green intensity fraction located in red-positive pixels.
+
+    Added columns provide stricter thresholded Manders, positive pixel areas,
+    Jaccard overlap and Pearson intensity correlation.
+    """
     red_vals = red_vals.astype(np.float64, copy=False)
     green_vals = green_vals.astype(np.float64, copy=False)
 
@@ -1469,16 +1603,44 @@ def compute_manders(red_vals, green_vals, red_thr, green_thr):
     red_pos = red_vals > red_thr
     green_pos = green_vals > green_thr
     both_pos = red_pos & green_pos
+    union_pos = red_pos | green_pos
+
+    n_pixels = int(red_vals.size)
+    red_positive_pixels = int(red_pos.sum())
+    green_positive_pixels = int(green_pos.sum())
+    double_positive_pixels = int(both_pos.sum())
+    union_positive_pixels = int(union_pos.sum())
 
     manders_red_in_green = red_vals[green_pos].sum() / red_sum if red_sum > 0 else np.nan
     manders_green_in_red = green_vals[red_pos].sum() / green_sum if green_sum > 0 else np.nan
 
+    red_positive_intensity = red_vals[red_pos].sum()
+    green_positive_intensity = green_vals[green_pos].sum()
+    thresholded_red_in_green = red_vals[both_pos].sum() / red_positive_intensity if red_positive_intensity > 0 else np.nan
+    thresholded_green_in_red = green_vals[both_pos].sum() / green_positive_intensity if green_positive_intensity > 0 else np.nan
+
     return {
         "manders_red_in_green": float(manders_red_in_green),
         "manders_green_in_red": float(manders_green_in_red),
+        "thresholded_manders_red_in_green": float(thresholded_red_in_green),
+        "thresholded_manders_green_in_red": float(thresholded_green_in_red),
         "overlap_fraction_pixels": float(np.mean(both_pos)) if both_pos.size > 0 else np.nan,
         "red_positive_fraction": float(np.mean(red_pos)) if red_pos.size > 0 else np.nan,
         "green_positive_fraction": float(np.mean(green_pos)) if green_pos.size > 0 else np.nan,
+        "red_positive_pixels": red_positive_pixels,
+        "green_positive_pixels": green_positive_pixels,
+        "double_positive_pixels": double_positive_pixels,
+        "union_positive_pixels": union_positive_pixels,
+        "red_area_overlap_fraction": _safe_divide(double_positive_pixels, red_positive_pixels),
+        "green_area_overlap_fraction": _safe_divide(double_positive_pixels, green_positive_pixels),
+        "overlap_jaccard_pixels": _safe_divide(double_positive_pixels, union_positive_pixels),
+        "red_positive_intensity": float(red_positive_intensity),
+        "green_positive_intensity": float(green_positive_intensity),
+        "red_intensity_in_green_positive_area": float(red_vals[green_pos].sum()),
+        "green_intensity_in_red_positive_area": float(green_vals[red_pos].sum()),
+        "pearson_all_pixels": _safe_pearson(red_vals, green_vals),
+        "pearson_positive_union_pixels": _safe_pearson(red_vals[union_pos], green_vals[union_pos]) if union_positive_pixels >= 2 else np.nan,
+        "total_pixels": n_pixels,
     }
 
 
@@ -1486,16 +1648,19 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
     red = rgb_hwc[:, :, 0]
     green = rgb_hwc[:, :, 1]
 
-    global_red_thr, global_green_thr = get_global_thresholds(red, green)
-
     if df_features is not None and not df_features.empty and "label" in df_features.columns:
         labels = df_features["label"].astype(int).values
     else:
         labels = np.unique(instance_labels)
         labels = labels[labels > 0]
 
+    # Global thresholds are now estimated inside the same segmented cell areas
+    # that are included in the analysis, rather than from the full image.
+    analysis_mask = np.isin(instance_labels, labels)
+    global_red_thr, global_green_thr = get_global_thresholds(red, green, analysis_mask=analysis_mask)
+
     log("Computing Manders metrics...")
-    log(f"  Global thresholds: red={global_red_thr:.2f}, green={global_green_thr:.2f}")
+    log(f"  Global thresholds inside segmented analysis mask: red={global_red_thr:.2f}, green={global_green_thr:.2f}")
     log(f"  Biological thresholds: red={params.biological_red_threshold:.2f}, green={params.biological_green_threshold:.2f}")
     log(f"  Labels to process: {len(labels)}")
 
@@ -1522,7 +1687,7 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
             params.biological_green_threshold,
         )
 
-        rows.append({
+        row = {
             "label": int(label),
             "global_red_threshold": float(global_red_thr),
             "global_green_threshold": float(global_green_thr),
@@ -1530,6 +1695,7 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
             "cell_otsu_green_threshold": float(cell_green_thr),
             "biological_red_threshold": float(params.biological_red_threshold),
             "biological_green_threshold": float(params.biological_green_threshold),
+            # Backwards-compatible core Manders columns
             "manders_global_red_in_green": global_metrics["manders_red_in_green"],
             "manders_global_green_in_red": global_metrics["manders_green_in_red"],
             "manders_global_overlap_fraction_pixels": global_metrics["overlap_fraction_pixels"],
@@ -1545,7 +1711,23 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
             "manders_biological_overlap_fraction_pixels": bio_metrics["overlap_fraction_pixels"],
             "manders_biological_red_positive_fraction": bio_metrics["red_positive_fraction"],
             "manders_biological_green_positive_fraction": bio_metrics["green_positive_fraction"],
-        })
+        }
+
+        # Add all complementary metrics for each thresholding strategy.
+        # Examples: manders_biological_overlap_jaccard_pixels,
+        # manders_biological_pearson_all_pixels,
+        # manders_biological_thresholded_manders_red_in_green.
+        for prefix, metrics in [
+            ("global", global_metrics),
+            ("cellotsu", percell_metrics),
+            ("biological", bio_metrics),
+        ]:
+            for metric_name, metric_value in metrics.items():
+                col = f"manders_{prefix}_{metric_name}"
+                if col not in row:
+                    row[col] = metric_value
+
+        rows.append(row)
 
         if i % 500 == 0:
             log(f"    Processed {i}/{len(labels)} cells...")
@@ -1558,6 +1740,7 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
         "n_double_positive": int(df_features["double_positive"].sum()) if df_features is not None and "double_positive" in df_features.columns else 0,
         "global_red_threshold": float(global_red_thr),
         "global_green_threshold": float(global_green_thr),
+        "global_threshold_region": "valid segmented cell mask",
         "biological_red_threshold": float(params.biological_red_threshold),
         "biological_green_threshold": float(params.biological_green_threshold),
     }
@@ -1569,20 +1752,32 @@ def compute_and_save_manders(instance_labels, rgb_stack_hwc, df_features, output
     rgb_hwc = np.asarray(rgb_stack_hwc)[:instance_labels.shape[0], :instance_labels.shape[1], :]
 
     if df_features is None or df_features.empty:
-        log("Skipping Manders: no valid cells in cell_features.csv")
+        log("Skipping Manders: no valid cells. Saving only the final merged cell table.")
         empty = pd.DataFrame()
-        empty.to_csv(output_folder / "manders_features.csv", index=False)
         if df_features is None:
             df_features = pd.DataFrame()
-        df_features.to_csv(output_folder / "cell_features_with_manders.csv", index=False)
+        merged_csv_path = output_folder / "cell_features_with_manders.csv"
+        df_features.to_csv(merged_csv_path, index=False)
         summary = {
             "n_cells_processed": 0,
             "global_red_threshold": None,
             "global_green_threshold": None,
+            "global_threshold_region": "valid segmented cell mask",
             "biological_red_threshold": float(params.biological_red_threshold),
             "biological_green_threshold": float(params.biological_green_threshold),
         }
         safe_json_dump(summary, output_folder / "manders_summary.json", indent=2)
+        compute_and_save_coexpression_summary(
+            instance_labels=instance_labels,
+            rgb_stack_hwc=rgb_hwc,
+            df_merged=df_features,
+            output_folder=output_folder,
+            params=params,
+            log=log,
+        )
+        log("Final cell-level output saved:")
+        log(f"  - {merged_csv_path.name}")
+        log("  - manders_summary.json")
         return empty, df_features, summary
 
     df_manders, summary = compute_manders_for_all_cells(
@@ -1593,12 +1788,9 @@ def compute_and_save_manders(instance_labels, rgb_stack_hwc, df_features, output
         log=log,
     )
 
-    manders_csv_path = output_folder / "manders_features.csv"
-    df_manders.to_csv(manders_csv_path, index=False)
-
     # Avoid duplicated pandas merge suffixes such as red_positive_x/red_positive_y.
-    # Positivity is a cell-level feature and is stored only once in cell_features.csv
-    # and in the merged cell_features_with_manders.csv.
+    # Positivity is a cell-level feature and is stored only once in the final
+    # merged cell_features_with_manders.csv.
     duplicate_cell_feature_cols = [
         "red_positive",
         "green_positive",
@@ -1615,12 +1807,366 @@ def compute_and_save_manders(instance_labels, rgb_stack_hwc, df_features, output
     summary_json_path = output_folder / "manders_summary.json"
     safe_json_dump(summary, summary_json_path, indent=2)
 
-    log("Manders outputs saved:")
-    log(f"  - {manders_csv_path.name}")
+    compute_and_save_coexpression_summary(
+        instance_labels=instance_labels,
+        rgb_stack_hwc=rgb_hwc,
+        df_merged=df_merged,
+        output_folder=output_folder,
+        params=params,
+        log=log,
+    )
+
+    log("Final cell-level output saved:")
     log(f"  - {merged_csv_path.name}")
+    log("Manders summary saved:")
     log(f"  - {summary_json_path.name}")
 
     return df_manders, df_merged, summary
+
+
+# ============================================================
+# Image-level co-expression / co-distribution summary
+# ============================================================
+
+def _series_sum(df, col):
+    if df is None or col not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+
+
+def _series_median(df, col):
+    if df is None or df.empty or col not in df.columns:
+        return np.nan
+    s = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    return float(s.median()) if len(s) else np.nan
+
+
+def _series_mean(df, col):
+    if df is None or df.empty or col not in df.columns:
+        return np.nan
+    s = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    return float(s.mean()) if len(s) else np.nan
+
+
+def compute_and_save_coexpression_summary(instance_labels, rgb_stack_hwc, df_merged, output_folder, params: PipelineParams, log=print):
+    """Save one-row image/core-level summary for aSMA-MYH11 co-expression.
+
+    The cell-level CSV remains the detailed output. This summary is the safer
+    unit for downstream group statistics because it avoids treating thousands
+    of cells from the same image as independent biological replicates.
+    """
+    output_folder = Path(output_folder)
+    df = df_merged.copy() if df_merged is not None else pd.DataFrame()
+
+    red_marker = _marker_token(getattr(params, "red_marker_name", "aSMA"))
+    green_marker = _marker_token(getattr(params, "green_marker_name", "MYH11"))
+    pair_marker = f"{red_marker}_{green_marker}"
+
+    h, w = instance_labels.shape[:2]
+    image_area_px = int(h) * int(w)
+    segmented_cell_area_px = int((np.asarray(instance_labels) > 0).sum())
+    n_cells = int(len(df))
+
+    n_red_positive = int(_series_sum(df, "red_positive"))
+    n_green_positive = int(_series_sum(df, "green_positive"))
+    n_double_positive = int(_series_sum(df, "double_positive"))
+    n_red_only = int(((df.get("red_positive", pd.Series(dtype=float)) == 1) & (df.get("green_positive", pd.Series(dtype=float)) != 1)).sum()) if n_cells else 0
+    n_green_only = int(((df.get("green_positive", pd.Series(dtype=float)) == 1) & (df.get("red_positive", pd.Series(dtype=float)) != 1)).sum()) if n_cells else 0
+    n_double_negative = int(n_cells - n_red_only - n_green_only - n_double_positive) if n_cells else 0
+
+    red_positive_area_px = _series_sum(df, "red_positive_area_px")
+    green_positive_area_px = _series_sum(df, "green_positive_area_px")
+    double_positive_area_px = _series_sum(df, "double_positive_area_px")
+    union_positive_area_px = _series_sum(df, "union_positive_area_px")
+
+    double_positive_cells = df[df["double_positive"] == 1] if n_cells and "double_positive" in df.columns else pd.DataFrame()
+    signal_positive_cells = df[(df.get("red_positive", 0) == 1) | (df.get("green_positive", 0) == 1)] if n_cells else pd.DataFrame()
+
+    summary = {
+        "red_marker_name": str(getattr(params, "red_marker_name", "aSMA")),
+        "green_marker_name": str(getattr(params, "green_marker_name", "MYH11")),
+        "pair_marker": pair_marker,
+        "n_cells": n_cells,
+        "image_area_px": image_area_px,
+        "segmented_cell_area_px": segmented_cell_area_px,
+        "n_red_positive_cells": n_red_positive,
+        "n_green_positive_cells": n_green_positive,
+        "n_double_positive_cells": n_double_positive,
+        "n_red_only_cells": n_red_only,
+        "n_green_only_cells": n_green_only,
+        "n_double_negative_cells": n_double_negative,
+        "pct_red_positive_cells": _safe_divide(100.0 * n_red_positive, n_cells),
+        "pct_green_positive_cells": _safe_divide(100.0 * n_green_positive, n_cells),
+        "pct_double_positive_cells": _safe_divide(100.0 * n_double_positive, n_cells),
+        "pct_red_only_cells": _safe_divide(100.0 * n_red_only, n_cells),
+        "pct_green_only_cells": _safe_divide(100.0 * n_green_only, n_cells),
+        "pct_double_negative_cells": _safe_divide(100.0 * n_double_negative, n_cells),
+        "red_positive_area_px": red_positive_area_px,
+        "green_positive_area_px": green_positive_area_px,
+        "double_positive_area_px": double_positive_area_px,
+        "union_positive_area_px": union_positive_area_px,
+        "double_positive_area_per_cell_px": _safe_divide(double_positive_area_px, n_cells),
+        "double_positive_area_fraction_segmented_cell_area": _safe_divide(double_positive_area_px, segmented_cell_area_px),
+        "double_positive_area_fraction_image_area": _safe_divide(double_positive_area_px, image_area_px),
+        "red_area_overlap_fraction_image_level": _safe_divide(double_positive_area_px, red_positive_area_px),
+        "green_area_overlap_fraction_image_level": _safe_divide(double_positive_area_px, green_positive_area_px),
+        "overlap_jaccard_pixels_image_level": _safe_divide(double_positive_area_px, union_positive_area_px),
+        "median_cell_double_positive_area_fraction": _series_median(df, "double_positive_area_fraction_cell"),
+        "median_cell_overlap_jaccard_pixels": _series_median(signal_positive_cells, "overlap_jaccard_pixels"),
+        "median_cell_red_area_overlap_fraction": _series_median(signal_positive_cells, "red_area_overlap_fraction"),
+        "median_cell_green_area_overlap_fraction": _series_median(signal_positive_cells, "green_area_overlap_fraction"),
+        "median_double_positive_cell_overlap_jaccard_pixels": _series_median(double_positive_cells, "overlap_jaccard_pixels"),
+        "median_double_positive_cell_red_area_overlap_fraction": _series_median(double_positive_cells, "red_area_overlap_fraction"),
+        "median_double_positive_cell_green_area_overlap_fraction": _series_median(double_positive_cells, "green_area_overlap_fraction"),
+        "median_manders_biological_red_in_green": _series_median(double_positive_cells, "manders_biological_red_in_green"),
+        "median_manders_biological_green_in_red": _series_median(double_positive_cells, "manders_biological_green_in_red"),
+        "median_manders_biological_thresholded_red_in_green": _series_median(double_positive_cells, "manders_biological_thresholded_manders_red_in_green"),
+        "median_manders_biological_thresholded_green_in_red": _series_median(double_positive_cells, "manders_biological_thresholded_manders_green_in_red"),
+        "median_pearson_biological_all_pixels": _series_median(double_positive_cells, "manders_biological_pearson_all_pixels"),
+        "median_pearson_biological_positive_union_pixels": _series_median(double_positive_cells, "manders_biological_pearson_positive_union_pixels"),
+    }
+
+    # Marker-specific aliases make the output easier to read in downstream plots.
+    summary[f"n_{red_marker}_positive_cells"] = n_red_positive
+    summary[f"n_{green_marker}_positive_cells"] = n_green_positive
+    summary[f"n_{pair_marker}_double_positive_cells"] = n_double_positive
+    summary[f"{pair_marker}_double_positive_area_px"] = double_positive_area_px
+    summary[f"{pair_marker}_double_positive_area_per_cell_px"] = summary["double_positive_area_per_cell_px"]
+    summary[f"{red_marker}_area_overlapping_{green_marker}_fraction_image_level"] = summary["red_area_overlap_fraction_image_level"]
+    summary[f"{green_marker}_area_overlapping_{red_marker}_fraction_image_level"] = summary["green_area_overlap_fraction_image_level"]
+
+    csv_path = output_folder / "image_level_summary.csv"
+    json_path = output_folder / "coexpression_summary.json"
+    pd.DataFrame([summary]).to_csv(csv_path, index=False)
+    safe_json_dump(summary, json_path, indent=2)
+
+    log("Image-level co-expression/co-distribution summary saved:")
+    log(f"  - {csv_path.name}")
+    log(f"  - {json_path.name}")
+
+    return summary
+
+
+# ============================================================
+# Representative center-crop visual outputs
+# ============================================================
+
+def _center_crop_or_pad(arr, size=1024, fill_value=0):
+    """Return a center crop of exact size x size, padding if needed."""
+    arr = np.asarray(arr)
+    if arr.ndim not in (2, 3):
+        raise ValueError(f"Unsupported array ndim for center crop: {arr.ndim}")
+
+    h, w = arr.shape[:2]
+    size = int(max(1, size))
+
+    y0 = max(0, (h - size) // 2)
+    x0 = max(0, (w - size) // 2)
+    y1 = min(h, y0 + size)
+    x1 = min(w, x0 + size)
+
+    crop = arr[y0:y1, x0:x1] if arr.ndim == 2 else arr[y0:y1, x0:x1, :]
+
+    out_shape = (size, size) if arr.ndim == 2 else (size, size, arr.shape[2])
+    out = np.full(out_shape, fill_value, dtype=arr.dtype)
+
+    cy = (size - crop.shape[0]) // 2
+    cx = (size - crop.shape[1]) // 2
+    if arr.ndim == 2:
+        out[cy:cy + crop.shape[0], cx:cx + crop.shape[1]] = crop
+    else:
+        out[cy:cy + crop.shape[0], cx:cx + crop.shape[1], :] = crop
+    return out
+
+
+def _save_png_rgb(path, rgb):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.imsave(str(path), _to_uint8_rgb(rgb))
+
+
+def _make_dapi_rgb(blue_channel):
+    b = _normalize_to_uint8(blue_channel)
+    out = np.zeros((b.shape[0], b.shape[1], 3), dtype=np.uint8)
+    out[:, :, 2] = b
+    out[:, :, 1] = (b.astype(np.float32) * 0.15).astype(np.uint8)
+    return out
+
+
+def _apply_color_overlay(base_rgb, mask, color, alpha=0.60):
+    base = _to_uint8_rgb(base_rgb).astype(np.float32)
+    mask = np.asarray(mask, dtype=bool)
+    color = np.asarray(color, dtype=np.float32).reshape(3)
+    out = base.copy()
+    if np.any(mask):
+        out[mask] = (1.0 - float(alpha)) * out[mask] + float(alpha) * color
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _overlay_boundaries(rgb, labels_or_mask, color=(255, 255, 255), thickness=2):
+    out = _to_uint8_rgb(rgb).copy()
+    arr = np.asarray(labels_or_mask)
+    if arr.ndim != 2:
+        return out
+    try:
+        boundaries = segmentation.find_boundaries(arr, mode="outer")
+        if int(thickness) > 1:
+            boundaries = morphology.binary_dilation(boundaries, morphology.disk(max(1, int(thickness) - 1)))
+        out[boundaries] = np.array(color, dtype=np.uint8)
+    except Exception:
+        pass
+    return out
+
+
+def _make_instance_overlay_rgb(base_rgb, instance_labels, alpha=0.35, boundary_thickness=2):
+    base = _to_uint8_rgb(base_rgb).astype(np.float32)
+    labels = np.asarray(instance_labels)
+    out = base.copy()
+    mask = labels > 0
+    if np.any(mask):
+        color_map = np.zeros((*labels.shape, 3), dtype=np.uint8)
+        color_map[..., 0] = ((labels * 37) % 255).astype(np.uint8)
+        color_map[..., 1] = ((labels * 91) % 255).astype(np.uint8)
+        color_map[..., 2] = ((labels * 53) % 255).astype(np.uint8)
+        out[mask] = (1.0 - float(alpha)) * out[mask] + float(alpha) * color_map[mask].astype(np.float32)
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    out = _overlay_boundaries(out, labels, color=(255, 255, 255), thickness=boundary_thickness)
+    return out
+
+
+def _make_cellmask_dapi_overlay(instance_labels, blue_channel, fill_color=(0, 220, 180), alpha=0.35):
+    dapi_rgb = _make_dapi_rgb(blue_channel)
+    mask = np.asarray(instance_labels) > 0
+    out = _apply_color_overlay(dapi_rgb, mask, fill_color, alpha=alpha)
+    out = _overlay_boundaries(out, instance_labels, color=(255, 255, 255), thickness=2)
+    return out
+
+
+def _make_overlap_category_overlay(base_rgb, red_pos_mask, green_pos_mask, instance_labels, alpha=0.60):
+    out = _to_uint8_rgb(base_rgb)
+    red_only = red_pos_mask & ~green_pos_mask
+    green_only = green_pos_mask & ~red_pos_mask
+    both = red_pos_mask & green_pos_mask
+    out = _apply_color_overlay(out, red_only, (255, 0, 0), alpha=alpha)
+    out = _apply_color_overlay(out, green_only, (0, 255, 0), alpha=alpha)
+    out = _apply_color_overlay(out, both, (255, 255, 0), alpha=alpha)
+    out = _overlay_boundaries(out, instance_labels, color=(255, 255, 255), thickness=2)
+    return out
+
+
+def _build_metric_label_image(instance_labels, df_visual, value_column):
+    labels = np.asarray(instance_labels)
+    metric_img = np.full(labels.shape, np.nan, dtype=np.float32)
+    if df_visual is None or df_visual.empty or value_column not in df_visual.columns or 'label' not in df_visual.columns:
+        return metric_img
+    mapping_df = df_visual[['label', value_column]].copy()
+    mapping_df['label'] = pd.to_numeric(mapping_df['label'], errors='coerce').astype('Int64')
+    mapping_df[value_column] = pd.to_numeric(mapping_df[value_column], errors='coerce')
+    mapping_df = mapping_df.dropna(subset=['label'])
+    for _, row in mapping_df.iterrows():
+        val = row[value_column]
+        if pd.isna(val):
+            continue
+        metric_img[labels == int(row['label'])] = float(val)
+    return metric_img
+
+
+def _save_metric_map_with_colorbar(path, base_rgb, instance_labels, metric_img, title, size=1024, cmap='magma', vmin=0.0, vmax=1.0):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dpi = 128
+    fig = plt.figure(figsize=(size / dpi, size / dpi), dpi=dpi, facecolor='white')
+    ax = fig.add_subplot(111)
+    ax.imshow(_to_uint8_rgb(base_rgb), alpha=0.35)
+
+    masked = np.ma.masked_invalid(metric_img)
+    im = ax.imshow(masked, cmap=cmap, vmin=vmin, vmax=vmax)
+    try:
+        boundaries = segmentation.find_boundaries(instance_labels, mode='outer')
+        if np.any(boundaries):
+            ax.contour(boundaries.astype(np.uint8), levels=[0.5], colors='white', linewidths=0.5)
+    except Exception:
+        pass
+
+    ax.set_title(title, fontsize=12)
+    ax.set_axis_off()
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=9)
+    fig.subplots_adjust(left=0.03, right=0.88, bottom=0.03, top=0.93)
+    fig.savefig(str(path), facecolor='white')
+    plt.close(fig)
+
+
+def save_representative_center_visualizations(instance_labels, rgb_stack_hwc, blue_channel, df_visual, output_folder, params: PipelineParams, log=print):
+    """Save illustrative 1024x1024 center-crop images for QC and interpretation."""
+    output_folder = Path(output_folder) / 'representative_center_1024'
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    crop_size = int(getattr(params, 'representative_crop_size', 1024) or 1024)
+    rgb_center = _center_crop_or_pad(rgb_stack_hwc, size=crop_size)
+    labels_center = _center_crop_or_pad(instance_labels, size=crop_size, fill_value=0)
+    blue_center = _center_crop_or_pad(blue_channel, size=crop_size, fill_value=0)
+
+    rgb_center_u8 = _to_uint8_rgb(rgb_center)
+
+    red_center = np.asarray(rgb_center)[..., 0].astype(np.float64, copy=False)
+    green_center = np.asarray(rgb_center)[..., 1].astype(np.float64, copy=False)
+    cell_mask_center = np.asarray(labels_center) > 0
+
+    red_thr = float(getattr(params, 'biological_red_threshold', 0.0) or 0.0)
+    green_thr = float(getattr(params, 'biological_green_threshold', 0.0) or 0.0)
+    red_pos = (red_center >= red_thr) & cell_mask_center
+    green_pos = (green_center >= green_thr) & cell_mask_center
+
+    red_marker = _marker_token(getattr(params, 'red_marker_name', 'aSMA'))
+    green_marker = _marker_token(getattr(params, 'green_marker_name', 'MYH11'))
+
+    _save_png_rgb(output_folder / '01_center_original_rgb.png', rgb_center_u8)
+    _save_png_rgb(output_folder / '02_center_cellmask_dapi.png', _make_cellmask_dapi_overlay(labels_center, blue_center, fill_color=(0, 220, 180), alpha=0.35))
+    _save_png_rgb(output_folder / '03_center_segmentation_on_rgb.png', _make_instance_overlay_rgb(rgb_center_u8, labels_center, alpha=0.32, boundary_thickness=2))
+
+    red_overlay = _apply_color_overlay(rgb_center_u8, red_pos, (255, 0, 0), alpha=0.60)
+    red_overlay = _overlay_boundaries(red_overlay, labels_center, color=(255, 255, 255), thickness=2)
+    _save_png_rgb(output_folder / f'04_center_{red_marker}_positive_overlay.png', red_overlay)
+
+    green_overlay = _apply_color_overlay(rgb_center_u8, green_pos, (0, 255, 0), alpha=0.60)
+    green_overlay = _overlay_boundaries(green_overlay, labels_center, color=(255, 255, 255), thickness=2)
+    _save_png_rgb(output_folder / f'05_center_{green_marker}_positive_overlay.png', green_overlay)
+
+    both_overlay = _apply_color_overlay(rgb_center_u8, red_pos, (255, 0, 0), alpha=0.60)
+    both_overlay = _apply_color_overlay(both_overlay, green_pos, (0, 255, 0), alpha=0.60)
+    both_overlay = _overlay_boundaries(both_overlay, labels_center, color=(255, 255, 255), thickness=2)
+    _save_png_rgb(output_folder / f'06_center_{red_marker}_{green_marker}_both_channels_overlay.png', both_overlay)
+
+    overlap_overlay = _make_overlap_category_overlay(rgb_center_u8, red_pos, green_pos, labels_center, alpha=0.60)
+    _save_png_rgb(output_folder / f'07_center_{red_marker}_{green_marker}_pixel_overlap_overlay.png', overlap_overlay)
+
+    m1_img = _build_metric_label_image(labels_center, df_visual, 'manders_biological_red_in_green')
+    m2_img = _build_metric_label_image(labels_center, df_visual, 'manders_biological_green_in_red')
+    _save_metric_map_with_colorbar(
+        output_folder / f'08_center_manders_M1_{red_marker}_in_{green_marker}.png',
+        rgb_center_u8, labels_center, m1_img,
+        title=f'Manders M1: {red_marker} signal in {green_marker}+ pixels',
+        size=crop_size, cmap='magma', vmin=0.0, vmax=1.0,
+    )
+    _save_metric_map_with_colorbar(
+        output_folder / f'09_center_manders_M2_{green_marker}_in_{red_marker}.png',
+        rgb_center_u8, labels_center, m2_img,
+        title=f'Manders M2: {green_marker} signal in {red_marker}+ pixels',
+        size=crop_size, cmap='viridis', vmin=0.0, vmax=1.0,
+    )
+
+    manifest = {
+        'crop_size': crop_size,
+        'red_marker_name': red_marker,
+        'green_marker_name': green_marker,
+        'biological_red_threshold': red_thr,
+        'biological_green_threshold': green_thr,
+        'files': sorted([p.name for p in output_folder.glob('*.png')]),
+    }
+    safe_json_dump(manifest, output_folder / 'representative_center_manifest.json', indent=2)
+    log(f"  Representative center visualizations saved in: {output_folder}")
+    return output_folder
 
 
 # ============================================================
@@ -1865,7 +2411,7 @@ def create_geojson_original_full_mask(instance_labels, df, output_folder, params
     return geojson_path
 
 
-def create_geojson_and_preview(instance_labels, rgb_norm, blue_nuclei, green_cyto, seeds_bool, df, output_folder, params: PipelineParams, log=print):
+def create_geojson_and_preview(instance_labels, rgb_norm, blue_nuclei, green_cyto, seeds_bool, df, output_folder, params: PipelineParams, log=print, rgb_stack_hwc=None, df_visual=None):
     output_folder = Path(output_folder)
 
     if params.save_geojson:
@@ -1939,8 +2485,24 @@ def create_geojson_and_preview(instance_labels, rgb_norm, blue_nuclei, green_cyt
             plt.close("all")
             gc.collect()
 
-
-
+    if bool(getattr(params, "include_additional_feature_figures", False)):
+        log("Generating additional feature figures...")
+        if rgb_stack_hwc is None:
+            log("  WARNING: Additional feature figures requested, but RGB stack was not provided.")
+        else:
+            try:
+                save_representative_center_visualizations(
+                    instance_labels=instance_labels,
+                    rgb_stack_hwc=rgb_stack_hwc,
+                    blue_channel=blue_nuclei,
+                    df_visual=df_visual if df_visual is not None else df,
+                    output_folder=output_folder,
+                    params=params,
+                    log=log,
+                )
+            except Exception as rep_error:
+                log(f"  WARNING: Representative center visualizations failed: {rep_error}")
+                log(traceback.format_exc())
 
 
 # ============================================================
@@ -2372,10 +2934,10 @@ def expected_output_files(output_folder, params: PipelineParams):
     output_folder = Path(output_folder)
     expected = [
         output_folder / "instances.tif",
-        output_folder / "cell_features.csv",
-        output_folder / "manders_features.csv",
         output_folder / "cell_features_with_manders.csv",
         output_folder / "manders_summary.json",
+        output_folder / "image_level_summary.csv",
+        output_folder / "coexpression_summary.json",
     ]
 
     if bool(getattr(params, "save_intermediate_rgb_cellcyto", True)):
@@ -2389,6 +2951,9 @@ def expected_output_files(output_folder, params: PipelineParams):
 
     if bool(getattr(params, "save_preview", True)):
         expected.append(output_folder / "preview.png")
+
+    if bool(getattr(params, "include_additional_feature_figures", False)):
+        expected.append(output_folder / "representative_center_1024" / "representative_center_manifest.json")
 
     if bool(getattr(params, "validation_enabled", False)):
         expected.append(output_folder / "validation" / "dice_report.json")
@@ -2410,9 +2975,9 @@ def output_folder_is_complete(output_folder, params: PipelineParams):
 
 
 def count_cells_from_existing_features(output_folder):
-    """Return number of rows in an existing cell_features.csv, if available."""
+    """Return number of rows in the final merged cell table, if available."""
     try:
-        path = Path(output_folder) / "cell_features.csv"
+        path = Path(output_folder) / "cell_features_with_manders.csv"
         if path.exists():
             return int(len(pd.read_csv(path)))
     except Exception:
@@ -2442,15 +3007,9 @@ def try_resume_missing_outputs(output_folder, params: PipelineParams, log=print)
     """
     Try to regenerate missing outputs from existing intermediate files.
 
-    This is intentionally conservative:
-      - If the folder is already complete, it returns success.
-      - If Manders files are missing but instances.tif, RGB.tif and
-        cell_features.csv exist, it recomputes Manders.
-      - If GeoJSON is missing but instances.tif and cell_features.csv exist,
-        it regenerates GeoJSON only.
-      - Preview is not regenerated from existing files because the saved
-        seed mask is not available. If preview.png is required and missing,
-        full reprocessing is still needed.
+    The final cell-level CSV is now only `cell_features_with_manders.csv`.
+    Older separate files (`cell_features.csv` and `manders_features.csv`) are no
+    longer required or generated.
     """
     output_folder = Path(output_folder)
 
@@ -2462,31 +3021,32 @@ def try_resume_missing_outputs(output_folder, params: PipelineParams, log=print)
     log(f"Existing output folder is incomplete. Missing: {', '.join(missing)}")
 
     inst_path = output_folder / "instances.tif"
-    features_path = output_folder / "cell_features.csv"
+    merged_path = output_folder / "cell_features_with_manders.csv"
     rgb_path = output_folder / "RGB.tif"
 
-    if not inst_path.exists() or not features_path.exists():
-        return False, "missing core files"
+    if not inst_path.exists():
+        return False, "missing instances.tif"
 
     try:
         instance_labels = tifffile.imread(str(inst_path))
-        df_features = pd.read_csv(features_path)
     except Exception as e:
-        return False, f"could not load existing core files: {e}"
+        return False, f"could not load instances.tif: {e}"
 
-    # Recompute Manders if missing and RGB is available.
-    manders_needed = (
-        not (output_folder / "manders_features.csv").exists() or
-        not (output_folder / "cell_features_with_manders.csv").exists() or
-        not (output_folder / "manders_summary.json").exists()
-    )
-
-    if manders_needed:
+    # If the merged table is missing but instances + RGB are available, rebuild
+    # the feature table and Manders metrics without needing to reread the source image.
+    if not merged_path.exists():
         if not rgb_path.exists():
-            return False, "Manders missing and RGB.tif is not available"
+            return False, "missing cell_features_with_manders.csv and RGB.tif is not available to rebuild it"
         try:
-            log("Resuming: recomputing missing Manders outputs from existing instances.tif + RGB.tif...")
+            log("Resuming: regenerating final cell_features_with_manders.csv from existing instances.tif + RGB.tif...")
             rgb_stack = load_rgb_hwc_from_tiff(rgb_path)
+            df_features = extract_features(
+                instance_labels=instance_labels,
+                rgb_stack_hwc=rgb_stack,
+                output_folder=output_folder,
+                params=params,
+                log=log,
+            )
             compute_and_save_manders(
                 instance_labels=instance_labels,
                 rgb_stack_hwc=rgb_stack,
@@ -2496,12 +3056,37 @@ def try_resume_missing_outputs(output_folder, params: PipelineParams, log=print)
                 log=log,
             )
         except Exception as e:
-            return False, f"could not resume Manders: {e}"
+            return False, f"could not rebuild final merged cell table: {e}"
+
+    try:
+        df_features = pd.read_csv(merged_path)
+    except Exception as e:
+        return False, f"could not load cell_features_with_manders.csv: {e}"
+
+    # Regenerate image-level co-expression summary if missing.
+    summary_needed = (
+        not (output_folder / "image_level_summary.csv").exists() or
+        not (output_folder / "coexpression_summary.json").exists()
+    )
+    if summary_needed:
+        try:
+            log("Resuming: regenerating missing image-level co-expression summary...")
+            rgb_stack = load_rgb_hwc_from_tiff(rgb_path) if rgb_path.exists() else None
+            compute_and_save_coexpression_summary(
+                instance_labels=instance_labels,
+                rgb_stack_hwc=rgb_stack,
+                df_merged=df_features,
+                output_folder=output_folder,
+                params=params,
+                log=log,
+            )
+        except Exception as e:
+            return False, f"could not resume co-expression summary: {e}"
 
     # Regenerate GeoJSON if requested and missing.
     if bool(getattr(params, "save_geojson", True)) and not (output_folder / "qupath_final.geojson").exists():
         try:
-            log("Resuming: regenerating missing GeoJSON from existing instances.tif + cell_features.csv...")
+            log("Resuming: regenerating missing GeoJSON from existing instances.tif + cell_features_with_manders.csv...")
             mode = str(getattr(params, "geojson_mode", "Fast bounding-box"))
             if mode.startswith("Original"):
                 create_geojson_original_full_mask(
@@ -2522,12 +3107,31 @@ def try_resume_missing_outputs(output_folder, params: PipelineParams, log=print)
         except Exception as e:
             return False, f"could not resume GeoJSON: {e}"
 
+    # Preview cannot be fully regenerated from existing outputs because the seed
+    # mask is not saved. Additional feature figures can be regenerated from
+    # instances + RGB + merged table if requested.
+    if bool(getattr(params, "include_additional_feature_figures", False)) and not (output_folder / "representative_center_1024" / "representative_center_manifest.json").exists():
+        try:
+            if not rgb_path.exists():
+                return False, "additional feature figures requested but RGB.tif is not available"
+            log("Resuming: regenerating missing additional feature figures...")
+            rgb_stack = load_rgb_hwc_from_tiff(rgb_path)
+            blue_channel = rgb_stack[:, :, 2]
+            save_representative_center_visualizations(
+                instance_labels=instance_labels,
+                rgb_stack_hwc=rgb_stack,
+                blue_channel=blue_channel,
+                df_visual=df_features,
+                output_folder=output_folder,
+                params=params,
+                log=log,
+            )
+        except Exception as e:
+            return False, f"could not resume additional feature figures: {e}"
+
     # Regenerate validation if requested and missing.
     if bool(getattr(params, "validation_enabled", False)) and not (output_folder / "validation" / "dice_report.json").exists():
         try:
-            # We do not know the original image path here with certainty, but the output folder
-            # name generally matches the image stem. For single-GT mode this is enough; for
-            # match-by-name, the caller should reprocess if exact matching fails.
             pseudo_image_path = output_folder.with_suffix(".tif")
             log("Resuming: regenerating missing validation/DICE from existing instances.tif...")
             run_validation_if_requested(
@@ -2637,7 +3241,7 @@ def process_single_file(original_path, params: PipelineParams, output_parent=Non
             log=log,
         )
 
-        compute_and_save_manders(
+        df_manders, df_merged, manders_summary = compute_and_save_manders(
             instance_labels,
             rgb_stack,
             df_features,
@@ -2680,6 +3284,8 @@ def process_single_file(original_path, params: PipelineParams, output_parent=Non
                 output_folder,
                 params,
                 log=log,
+                rgb_stack_hwc=rgb_stack,
+                df_visual=df_merged,
             )
         except Exception as post_error:
             postprocess_warning = (
@@ -3381,8 +3987,8 @@ class CellWellSegmentationGUI(QMainWindow):
             "6. Export masks, CSV features, Manders metrics, preview images, GeoJSON, and optional validation reports.\n\n"
             "Main outputs per image:\n"
             "- instances.tif: instance segmentation mask.\n"
-            "- cell_features.csv: cell-level morphology and intensity features.\n"
-            "- manders_features.csv: cell-level Manders colocalization metrics.\n"
+            "- cell_features_with_manders.csv: cell-level morphology and intensity features.\n"
+            "- cell_features_with_manders.csv: cell-level Manders colocalization metrics.\n"
             "- cell_features_with_manders.csv: merged feature table.\n"
             "- manders_summary.json: threshold and colocalization summary.\n"
             "- qupath_final.geojson: QuPath-compatible cell annotations.\n"
@@ -3559,6 +4165,12 @@ class CellWellSegmentationGUI(QMainWindow):
 
         self.save_preview_chk = QCheckBox("Save preview.png")
         self.save_preview_chk.setChecked(True)
+        self.include_feature_figures_chk = QCheckBox("Include additional feature figures")
+        self.include_feature_figures_chk.setToolTip(
+            "Save 1024x1024 center-crop illustrative PNGs for RGB, segmentation, "
+            "positive overlays, pixel overlap, and Manders M1/M2 maps."
+        )
+        self.include_feature_figures_chk.setChecked(False)
 
         # ------------------------------------------------------------
         # Validation / DICE controls
@@ -3597,7 +4209,8 @@ class CellWellSegmentationGUI(QMainWindow):
         self._add_grid_row(custom_grid, r, "GeoJSON mode", self.geojson_mode_combo, "Simplify tolerance", self.geojson_simplify); r += 1
         self._add_grid_row(custom_grid, r, "GeoJSON log every N", self.geojson_log_every, "", QLabel("")); r += 1
 
-        custom_grid.addWidget(self.save_preview_chk, r, 0, 1, 2); r += 1
+        custom_grid.addWidget(self.save_preview_chk, r, 0, 1, 2)
+        custom_grid.addWidget(self.include_feature_figures_chk, r, 2, 1, 2); r += 1
 
         # Validation options. These compare the final predicted mask against a
         # ground-truth GeoJSON and save DICE/IoU reports under validation/.
@@ -3731,6 +4344,8 @@ class CellWellSegmentationGUI(QMainWindow):
         self.save_rgb_chk.setChecked(bool(p.save_intermediate_rgb_cellcyto))
         self.save_geojson_chk.setChecked(bool(p.save_geojson))
         self.save_preview_chk.setChecked(bool(p.save_preview))
+        if hasattr(self, "include_feature_figures_chk"):
+            self.include_feature_figures_chk.setChecked(bool(getattr(p, "include_additional_feature_figures", False)))
         self.geojson_mode_combo.setCurrentText(str(getattr(p, "geojson_mode", "Fast bounding-box")))
         self.geojson_simplify.setValue(float(getattr(p, "geojson_simplify_tolerance", 0.0)))
         self.geojson_log_every.setValue(int(getattr(p, "geojson_log_every", 250)))
@@ -3763,6 +4378,7 @@ class CellWellSegmentationGUI(QMainWindow):
                 chosen.save_intermediate_rgb_cellcyto = current.save_intermediate_rgb_cellcyto
                 chosen.save_geojson = current.save_geojson
                 chosen.save_preview = current.save_preview
+                chosen.include_additional_feature_figures = getattr(current, "include_additional_feature_figures", False)
                 chosen.max_full_read_pixels = current.max_full_read_pixels
                 chosen.geojson_mode = current.geojson_mode
                 chosen.geojson_simplify_tolerance = current.geojson_simplify_tolerance
@@ -3866,6 +4482,8 @@ class CellWellSegmentationGUI(QMainWindow):
             p = default_params()
             if hasattr(self, "existing_output_combo"):
                 p.existing_output_action = str(self.existing_output_combo.currentText())
+            if hasattr(self, "include_feature_figures_chk"):
+                p.include_additional_feature_figures = bool(self.include_feature_figures_chk.isChecked())
             if hasattr(self, "validation_enable_chk"):
                 p.validation_enabled = bool(self.validation_enable_chk.isChecked())
                 p.validation_mode = str(self.validation_mode_combo.currentText())
@@ -3899,6 +4517,7 @@ class CellWellSegmentationGUI(QMainWindow):
             save_intermediate_rgb_cellcyto=bool(self.save_rgb_chk.isChecked()),
             save_geojson=bool(self.save_geojson_chk.isChecked()),
             save_preview=bool(self.save_preview_chk.isChecked()),
+            include_additional_feature_figures=bool(self.include_feature_figures_chk.isChecked()) if hasattr(self, "include_feature_figures_chk") else False,
             geojson_mode=str(self.geojson_mode_combo.currentText()),
             geojson_simplify_tolerance=float(self.geojson_simplify.value()),
             geojson_log_every=int(self.geojson_log_every.value()),
@@ -3968,6 +4587,7 @@ class CellWellSegmentationGUI(QMainWindow):
         self.append_log(f"Images: {len(self.paths)}")
         self.append_log(f"Parameter mode: {self.param_mode_combo.currentText()}")
         self.append_log(f"GeoJSON mode: {params.geojson_mode} | simplify tolerance: {params.geojson_simplify_tolerance}")
+        self.append_log(f"Additional feature figures: {bool(getattr(params, 'include_additional_feature_figures', False))}")
         self.append_log(f"Existing output behavior: {params.existing_output_action}")
         if bool(getattr(params, "validation_enabled", False)):
             self.append_log(f"Validation: {params.validation_mode} | IoU threshold: {params.validation_iou_threshold}")

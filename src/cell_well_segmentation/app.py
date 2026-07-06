@@ -101,7 +101,7 @@ def safe_json_dump(data, output_path, indent=2):
 # ============================================================
 
 APP_NAME = "Cell Well Segmentation"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.1-clean-features-clean-shape-names"
 APP_TITLE = "Cell Well Segmentation: Immunofluorescence Cell Segmentation, Quantification and Validation"
 APP_AUTHOR = "José J. Rodriguez Rojas"
 APP_YEAR = "2026"
@@ -989,8 +989,8 @@ class PipelineParams:
 
     # Biological marker labels used in output column aliases and summaries.
     # The raw channel columns remain red/green for backwards compatibility.
-    red_marker_name: str = "aSMA"
-    green_marker_name: str = "MYH11"
+    red_marker_name: str = "MYH11"
+    green_marker_name: str = "aSMA"
 
     preview_downsample_factor: int = 4
     preview_dpi: int = 200
@@ -1375,32 +1375,25 @@ def _marker_token(name):
     return token or "marker"
 
 
+
 def _add_marker_alias_columns(df, params: PipelineParams):
-    """Add aSMA/MYH11-style aliases while keeping red/green columns unchanged."""
+    """
+    Add only non-numeric channel metadata to avoid duplicated feature columns.
+
+    Previous versions created marker-named numeric aliases such as
+    aSMA_area_overlapping_MYH11_fraction. Those aliases duplicated red/green
+    columns and could invert the biological interpretation when the red/green
+    marker names were configured incorrectly. The quantitative table now keeps
+    one canonical numeric column per measurement and stores the red/green marker
+    meaning as metadata columns.
+    """
     if df is None or df.empty:
         return df
 
-    red_name = _marker_token(getattr(params, "red_marker_name", "aSMA"))
-    green_name = _marker_token(getattr(params, "green_marker_name", "MYH11"))
-    pair_name = f"{red_name}_{green_name}"
-
-    alias_map = {
-        f"{red_name}_positive": "red_positive",
-        f"{green_name}_positive": "green_positive",
-        f"{pair_name}_double_positive": "double_positive",
-        f"{red_name}_positive_area_px": "red_positive_area_px",
-        f"{green_name}_positive_area_px": "green_positive_area_px",
-        f"{pair_name}_double_positive_area_px": "double_positive_area_px",
-        f"{pair_name}_union_positive_area_px": "union_positive_area_px",
-        f"{red_name}_area_overlapping_{green_name}_fraction": "red_area_overlap_fraction",
-        f"{green_name}_area_overlapping_{red_name}_fraction": "green_area_overlap_fraction",
-        f"{pair_name}_overlap_jaccard_pixels": "overlap_jaccard_pixels",
-    }
-
-    for alias, source in alias_map.items():
-        if source in df.columns and alias not in df.columns:
-            df[alias] = df[source]
-
+    df["red_marker_name"] = str(getattr(params, "red_marker_name", "MYH11"))
+    df["green_marker_name"] = str(getattr(params, "green_marker_name", "aSMA"))
+    df["red_threshold_used"] = float(getattr(params, "biological_red_threshold", np.nan))
+    df["green_threshold_used"] = float(getattr(params, "biological_green_threshold", np.nan))
     return df
 
 
@@ -1419,25 +1412,43 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
     blue = rgb_hwc[:, :, 2]
 
     log(f"  RGB ranges:")
-    log(f"    R: {red.min()} - {red.max()}")
-    log(f"    G: {green.min()} - {green.max()}")
+    log(f"    R ({getattr(params, 'red_marker_name', 'MYH11')}): {red.min()} - {red.max()}")
+    log(f"    G ({getattr(params, 'green_marker_name', 'aSMA')}): {green.min()} - {green.max()}")
     log(f"    B: {blue.min()} - {blue.max()}")
 
-    props_shape = regionprops_table(instance_labels, properties=["label", "area", "perimeter"])
+    shape_properties = [
+        "label",
+        "area",
+        "perimeter",
+        "major_axis_length",
+        "minor_axis_length",
+        "orientation",
+        "eccentricity",
+        "solidity",
+        "extent",
+    ]
+    props_shape = regionprops_table(instance_labels, properties=shape_properties)
 
     if len(props_shape["label"]) == 0:
         df = pd.DataFrame(columns=[
             "label", "area_px", "perimeter_px",
+            "fitted_ellipse_major_axis_px", "fitted_ellipse_minor_axis_px",
+            "ellipse_orientation_rad", "ellipse_orientation_deg",
+            "elongation_ratio", "ellipse_roundness",
+            "fitted_ellipse_area_px", "spreading_area_px",
+            "spreading_index_area_over_fitted_ellipse_area",
+            "eccentricity", "solidity", "extent",
             "red_max", "red_mean", "green_max", "green_mean", "blue_max", "blue_mean",
             "centroid_y", "centroid_x",
             "red_positive", "green_positive", "double_positive",
             "red_positive_area_px", "green_positive_area_px", "double_positive_area_px",
             "union_positive_area_px", "red_only_area_px", "green_only_area_px",
             "red_positive_area_fraction_cell", "green_positive_area_fraction_cell",
-            "double_positive_area_fraction_cell", "overlap_jaccard_pixels",
-            "red_area_overlap_fraction", "green_area_overlap_fraction",
+            "double_positive_area_fraction_cell", "positive_area_jaccard_index",
+            "red_positive_area_overlapping_green_fraction",
+            "green_positive_area_overlapping_red_fraction",
             "red_positive_integrated_intensity", "green_positive_integrated_intensity",
-            "red_intensity_in_green_positive_area", "green_intensity_in_red_positive_area",
+            "red_intensity_in_green_positive_pixels", "green_intensity_in_red_positive_pixels",
         ])
         log("  No cells found. Empty feature table will be carried forward to cell_features_with_manders.csv.")
         return df
@@ -1447,10 +1458,50 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
     props_blue = regionprops_table(instance_labels, intensity_image=blue, properties=["label", "max_intensity", "mean_intensity"])
     props_centroids = regionprops_table(instance_labels, properties=["label", "centroid"])
 
+    major = np.asarray(props_shape["major_axis_length"], dtype=np.float64)
+    minor = np.asarray(props_shape["minor_axis_length"], dtype=np.float64)
+    area = np.asarray(props_shape["area"], dtype=np.float64)
+
+    fitted_ellipse_area = np.pi * (major / 2.0) * (minor / 2.0)
+
     df = pd.DataFrame({
         "label": props_shape["label"],
         "area_px": props_shape["area"],
         "perimeter_px": props_shape["perimeter"],
+
+        # Ellipse-based geometry from the segmented cell mask.
+        # major/minor are equivalent ellipse axes derived from the object moments.
+        "fitted_ellipse_major_axis_px": major,
+        "fitted_ellipse_minor_axis_px": minor,
+        "ellipse_orientation_rad": props_shape["orientation"],
+        "ellipse_orientation_deg": np.degrees(np.asarray(props_shape["orientation"], dtype=np.float64)),
+        "elongation_ratio": np.divide(
+            major,
+            minor,
+            out=np.full_like(major, np.nan, dtype=np.float64),
+            where=minor > 0,
+        ),
+        # Ellipse roundness formula: 4*Area/(pi*Major^2)
+        "ellipse_roundness": np.divide(
+            4.0 * area,
+            np.pi * np.square(major),
+            out=np.full_like(area, np.nan, dtype=np.float64),
+            where=major > 0,
+        ),
+        "fitted_ellipse_area_px": fitted_ellipse_area,
+        # "Spreading" is exported explicitly as raw cell area plus a normalized
+        # area-vs-fitted-ellipse index. This avoids mixing area and shape ratio.
+        "spreading_area_px": area,
+        "spreading_index_area_over_fitted_ellipse_area": np.divide(
+            area,
+            fitted_ellipse_area,
+            out=np.full_like(area, np.nan, dtype=np.float64),
+            where=fitted_ellipse_area > 0,
+        ),
+        "eccentricity": props_shape["eccentricity"],
+        "solidity": props_shape["solidity"],
+        "extent": props_shape["extent"],
+
         "red_max": props_red["max_intensity"],
         "red_mean": props_red["mean_intensity"],
         "green_max": props_green["max_intensity"],
@@ -1471,9 +1522,8 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
             df.at[idx, f"{prefix}_p75"] = float(np.percentile(vals, 75))
 
         # Pixel-level biological overlap inside each segmented cell.
-        # These use the user-defined biological thresholds and are therefore
-        # directly interpretable as aSMA/MYH11 positive area when red=aSMA and
-        # green=MYH11. They complement Manders, which is intensity-weighted.
+        # red = MYH11 by default; green = aSMA by default.
+        # These are AREA/PIXEL-FRACTION metrics, not Manders coefficients.
         red_vals_cell = red[mask].ravel().astype(np.float64, copy=False)
         green_vals_cell = green[mask].ravel().astype(np.float64, copy=False)
         n_cell_px = int(red_vals_cell.size)
@@ -1497,13 +1547,13 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
         df.at[idx, "red_positive_area_fraction_cell"] = _safe_divide(red_area_px, n_cell_px)
         df.at[idx, "green_positive_area_fraction_cell"] = _safe_divide(green_area_px, n_cell_px)
         df.at[idx, "double_positive_area_fraction_cell"] = _safe_divide(double_area_px, n_cell_px)
-        df.at[idx, "overlap_jaccard_pixels"] = _safe_divide(double_area_px, union_area_px)
-        df.at[idx, "red_area_overlap_fraction"] = _safe_divide(double_area_px, red_area_px)
-        df.at[idx, "green_area_overlap_fraction"] = _safe_divide(double_area_px, green_area_px)
+        df.at[idx, "positive_area_jaccard_index"] = _safe_divide(double_area_px, union_area_px)
+        df.at[idx, "red_positive_area_overlapping_green_fraction"] = _safe_divide(double_area_px, red_area_px)
+        df.at[idx, "green_positive_area_overlapping_red_fraction"] = _safe_divide(double_area_px, green_area_px)
         df.at[idx, "red_positive_integrated_intensity"] = float(red_vals_cell[red_pos_px_mask].sum())
         df.at[idx, "green_positive_integrated_intensity"] = float(green_vals_cell[green_pos_px_mask].sum())
-        df.at[idx, "red_intensity_in_green_positive_area"] = float(red_vals_cell[green_pos_px_mask].sum())
-        df.at[idx, "green_intensity_in_red_positive_area"] = float(green_vals_cell[red_pos_px_mask].sum())
+        df.at[idx, "red_intensity_in_green_positive_pixels"] = float(red_vals_cell[green_pos_px_mask].sum())
+        df.at[idx, "green_intensity_in_red_positive_pixels"] = float(green_vals_cell[red_pos_px_mask].sum())
         df.at[idx, "red_mean_positive_pixels"] = float(np.mean(red_vals_cell[red_pos_px_mask])) if red_area_px > 0 else np.nan
         df.at[idx, "green_mean_positive_pixels"] = float(np.mean(green_vals_cell[green_pos_px_mask])) if green_area_px > 0 else np.nan
 
@@ -1515,14 +1565,9 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
     df["green_total"] = df["green_mean"] * df["area_px"]
     df["blue_total"] = df["blue_mean"] * df["area_px"]
 
-    # ------------------------------------------------------------
-    # Biological positivity flags
-    # ------------------------------------------------------------
-    # These columns are annotations for downstream analysis. They do not change
-    # segmentation, cell filtering, or Manders computation. A cell is marked as
-    # red_positive/green_positive when its mean channel intensity is greater than
-    # or equal to the user-defined biological threshold. double_positive means
-    # both red_positive and green_positive are True.
+    # Biological positivity flags based on mean cell intensity.
+    # These are cell-level classifications and are distinct from positive
+    # pixel-area fractions.
     df["red_positive"] = (df["red_mean"] >= float(params.biological_red_threshold)).astype(int)
     df["green_positive"] = (df["green_mean"] >= float(params.biological_green_threshold)).astype(int)
     df["double_positive"] = ((df["red_positive"] == 1) & (df["green_positive"] == 1)).astype(int)
@@ -1540,7 +1585,6 @@ def extract_features(instance_labels, rgb_stack_hwc, output_folder, params: Pipe
     log("  Cell feature table will be saved only after Manders metrics are merged.")
 
     return df
-
 
 # ============================================================
 # Manders colocalization
@@ -1584,15 +1628,24 @@ def get_global_thresholds(red, green, analysis_mask=None):
     return float(red_thr), float(green_thr)
 
 
+
 def compute_manders(red_vals, green_vals, red_thr, green_thr):
-    """Compute asymmetric Manders and complementary pixel-overlap metrics.
+    """
+    Compute true intensity-weighted Manders metrics plus Pearson correlation.
 
-    Existing columns are preserved:
-      - manders_red_in_green: red intensity fraction located in green-positive pixels.
-      - manders_green_in_red: green intensity fraction located in red-positive pixels.
+    Definitions:
+      - manders_red_in_green:
+          sum(red intensity in green-positive pixels) / sum(red intensity in all cell pixels)
+      - manders_green_in_red:
+          sum(green intensity in red-positive pixels) / sum(green intensity in all cell pixels)
+      - thresholded_red_in_green:
+          sum(red intensity in double-positive pixels) / sum(red intensity in red-positive pixels)
+      - thresholded_green_in_red:
+          sum(green intensity in double-positive pixels) / sum(green intensity in green-positive pixels)
 
-    Added columns provide stricter thresholded Manders, positive pixel areas,
-    Jaccard overlap and Pearson intensity correlation.
+    Pixel/area fractions are intentionally NOT returned here. They are already
+    calculated once in extract_features() as area metrics to avoid duplicated
+    or misleading "manders_*_positive_fraction" columns.
     """
     red_vals = red_vals.astype(np.float64, copy=False)
     green_vals = green_vals.astype(np.float64, copy=False)
@@ -1600,47 +1653,37 @@ def compute_manders(red_vals, green_vals, red_thr, green_thr):
     red_sum = red_vals.sum()
     green_sum = green_vals.sum()
 
-    red_pos = red_vals > red_thr
-    green_pos = green_vals > green_thr
+    # Use >= to match the biological positivity flags and area-fraction metrics.
+    red_pos = red_vals >= red_thr
+    green_pos = green_vals >= green_thr
     both_pos = red_pos & green_pos
     union_pos = red_pos | green_pos
 
-    n_pixels = int(red_vals.size)
-    red_positive_pixels = int(red_pos.sum())
-    green_positive_pixels = int(green_pos.sum())
-    double_positive_pixels = int(both_pos.sum())
-    union_positive_pixels = int(union_pos.sum())
-
-    manders_red_in_green = red_vals[green_pos].sum() / red_sum if red_sum > 0 else np.nan
-    manders_green_in_red = green_vals[red_pos].sum() / green_sum if green_sum > 0 else np.nan
-
     red_positive_intensity = red_vals[red_pos].sum()
     green_positive_intensity = green_vals[green_pos].sum()
+
+    red_intensity_in_green_positive_pixels = red_vals[green_pos].sum()
+    green_intensity_in_red_positive_pixels = green_vals[red_pos].sum()
+
+    manders_red_in_green = red_intensity_in_green_positive_pixels / red_sum if red_sum > 0 else np.nan
+    manders_green_in_red = green_intensity_in_red_positive_pixels / green_sum if green_sum > 0 else np.nan
+
     thresholded_red_in_green = red_vals[both_pos].sum() / red_positive_intensity if red_positive_intensity > 0 else np.nan
     thresholded_green_in_red = green_vals[both_pos].sum() / green_positive_intensity if green_positive_intensity > 0 else np.nan
 
+    union_positive_pixels = int(union_pos.sum())
+
     return {
-        "manders_red_in_green": float(manders_red_in_green),
-        "manders_green_in_red": float(manders_green_in_red),
-        "thresholded_manders_red_in_green": float(thresholded_red_in_green),
-        "thresholded_manders_green_in_red": float(thresholded_green_in_red),
-        "overlap_fraction_pixels": float(np.mean(both_pos)) if both_pos.size > 0 else np.nan,
-        "red_positive_fraction": float(np.mean(red_pos)) if red_pos.size > 0 else np.nan,
-        "green_positive_fraction": float(np.mean(green_pos)) if green_pos.size > 0 else np.nan,
-        "red_positive_pixels": red_positive_pixels,
-        "green_positive_pixels": green_positive_pixels,
-        "double_positive_pixels": double_positive_pixels,
-        "union_positive_pixels": union_positive_pixels,
-        "red_area_overlap_fraction": _safe_divide(double_positive_pixels, red_positive_pixels),
-        "green_area_overlap_fraction": _safe_divide(double_positive_pixels, green_positive_pixels),
-        "overlap_jaccard_pixels": _safe_divide(double_positive_pixels, union_positive_pixels),
+        "red_in_green": float(manders_red_in_green),
+        "green_in_red": float(manders_green_in_red),
+        "thresholded_red_in_green": float(thresholded_red_in_green),
+        "thresholded_green_in_red": float(thresholded_green_in_red),
         "red_positive_intensity": float(red_positive_intensity),
         "green_positive_intensity": float(green_positive_intensity),
-        "red_intensity_in_green_positive_area": float(red_vals[green_pos].sum()),
-        "green_intensity_in_red_positive_area": float(green_vals[red_pos].sum()),
+        "red_intensity_in_green_positive_pixels": float(red_intensity_in_green_positive_pixels),
+        "green_intensity_in_red_positive_pixels": float(green_intensity_in_red_positive_pixels),
         "pearson_all_pixels": _safe_pearson(red_vals, green_vals),
         "pearson_positive_union_pixels": _safe_pearson(red_vals[union_pos], green_vals[union_pos]) if union_positive_pixels >= 2 else np.nan,
-        "total_pixels": n_pixels,
     }
 
 
@@ -1654,17 +1697,23 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
         labels = np.unique(instance_labels)
         labels = labels[labels > 0]
 
-    # Global thresholds are now estimated inside the same segmented cell areas
-    # that are included in the analysis, rather than from the full image.
     analysis_mask = np.isin(instance_labels, labels)
     global_red_thr, global_green_thr = get_global_thresholds(red, green, analysis_mask=analysis_mask)
 
     log("Computing Manders metrics...")
+    log(f"  Red marker: {getattr(params, 'red_marker_name', 'MYH11')} | Green marker: {getattr(params, 'green_marker_name', 'aSMA')}")
     log(f"  Global thresholds inside segmented analysis mask: red={global_red_thr:.2f}, green={global_green_thr:.2f}")
     log(f"  Biological thresholds: red={params.biological_red_threshold:.2f}, green={params.biological_green_threshold:.2f}")
     log(f"  Labels to process: {len(labels)}")
 
     rows = []
+
+    def _add_prefixed_metrics(row, prefix, metrics):
+        # Only true intensity-weighted Manders and Pearson metrics are exported here.
+        # Pixel/area overlap metrics are exported once in extract_features().
+        for metric_name, metric_value in metrics.items():
+            row[f"manders_{prefix}_{metric_name}"] = metric_value
+        return row
 
     for i, label in enumerate(labels, 1):
         mask = instance_labels == label
@@ -1695,37 +1744,11 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
             "cell_otsu_green_threshold": float(cell_green_thr),
             "biological_red_threshold": float(params.biological_red_threshold),
             "biological_green_threshold": float(params.biological_green_threshold),
-            # Backwards-compatible core Manders columns
-            "manders_global_red_in_green": global_metrics["manders_red_in_green"],
-            "manders_global_green_in_red": global_metrics["manders_green_in_red"],
-            "manders_global_overlap_fraction_pixels": global_metrics["overlap_fraction_pixels"],
-            "manders_global_red_positive_fraction": global_metrics["red_positive_fraction"],
-            "manders_global_green_positive_fraction": global_metrics["green_positive_fraction"],
-            "manders_cellotsu_red_in_green": percell_metrics["manders_red_in_green"],
-            "manders_cellotsu_green_in_red": percell_metrics["manders_green_in_red"],
-            "manders_cellotsu_overlap_fraction_pixels": percell_metrics["overlap_fraction_pixels"],
-            "manders_cellotsu_red_positive_fraction": percell_metrics["red_positive_fraction"],
-            "manders_cellotsu_green_positive_fraction": percell_metrics["green_positive_fraction"],
-            "manders_biological_red_in_green": bio_metrics["manders_red_in_green"],
-            "manders_biological_green_in_red": bio_metrics["manders_green_in_red"],
-            "manders_biological_overlap_fraction_pixels": bio_metrics["overlap_fraction_pixels"],
-            "manders_biological_red_positive_fraction": bio_metrics["red_positive_fraction"],
-            "manders_biological_green_positive_fraction": bio_metrics["green_positive_fraction"],
         }
 
-        # Add all complementary metrics for each thresholding strategy.
-        # Examples: manders_biological_overlap_jaccard_pixels,
-        # manders_biological_pearson_all_pixels,
-        # manders_biological_thresholded_manders_red_in_green.
-        for prefix, metrics in [
-            ("global", global_metrics),
-            ("cellotsu", percell_metrics),
-            ("biological", bio_metrics),
-        ]:
-            for metric_name, metric_value in metrics.items():
-                col = f"manders_{prefix}_{metric_name}"
-                if col not in row:
-                    row[col] = metric_value
+        row = _add_prefixed_metrics(row, "global", global_metrics)
+        row = _add_prefixed_metrics(row, "cellotsu", percell_metrics)
+        row = _add_prefixed_metrics(row, "biological", bio_metrics)
 
         rows.append(row)
 
@@ -1743,8 +1766,118 @@ def compute_manders_for_all_cells(instance_labels, rgb_hwc, df_features, params:
         "global_threshold_region": "valid segmented cell mask",
         "biological_red_threshold": float(params.biological_red_threshold),
         "biological_green_threshold": float(params.biological_green_threshold),
+        "red_marker_name": str(getattr(params, "red_marker_name", "MYH11")),
+        "green_marker_name": str(getattr(params, "green_marker_name", "aSMA")),
+        "notes": (
+            "Manders columns are intensity-weighted. Pixel/area overlap columns "
+            "are kept separately in the feature table and are not prefixed with manders_."
+        ),
     }
     return df_manders, summary
+
+
+def validate_overlap_metric_consistency(df, log=print, tolerance=1e-6):
+    """
+    Verify internal consistency of area-overlap calculations.
+
+    Checks:
+      union = red_area + green_area - double_area
+      red_fraction = red_area / cell_area
+      green_fraction = green_area / cell_area
+      double_fraction = double_area / cell_area
+      jaccard = double_area / union
+      red_overlap = double_area / red_area
+      green_overlap = double_area / green_area
+    """
+    if df is None or df.empty:
+        return {"status": "empty", "n_rows": 0, "n_failed_rows": 0}
+
+    required = [
+        "area_px", "red_positive_area_px", "green_positive_area_px",
+        "double_positive_area_px", "union_positive_area_px",
+        "red_positive_area_fraction_cell", "green_positive_area_fraction_cell",
+        "double_positive_area_fraction_cell", "positive_area_jaccard_index",
+        "red_positive_area_overlapping_green_fraction",
+        "green_positive_area_overlapping_red_fraction",
+    ]
+
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        msg = f"Overlap metric validation skipped; missing columns: {missing}"
+        log("  WARNING: " + msg)
+        return {"status": "missing_columns", "missing_columns": missing, "n_rows": int(len(df)), "n_failed_rows": None}
+
+    numeric = df[required].apply(pd.to_numeric, errors="coerce")
+
+    area = numeric["area_px"]
+    red_area = numeric["red_positive_area_px"]
+    green_area = numeric["green_positive_area_px"]
+    double_area = numeric["double_positive_area_px"]
+    union_area = numeric["union_positive_area_px"]
+
+    checks = pd.DataFrame({
+        "union_check": np.isclose(union_area, red_area + green_area - double_area, atol=tolerance, equal_nan=True),
+        "red_fraction_check": np.isclose(numeric["red_positive_area_fraction_cell"], red_area / area.replace(0, np.nan), atol=tolerance, equal_nan=True),
+        "green_fraction_check": np.isclose(numeric["green_positive_area_fraction_cell"], green_area / area.replace(0, np.nan), atol=tolerance, equal_nan=True),
+        "double_fraction_check": np.isclose(numeric["double_positive_area_fraction_cell"], double_area / area.replace(0, np.nan), atol=tolerance, equal_nan=True),
+        "jaccard_check": np.isclose(numeric["positive_area_jaccard_index"], double_area / union_area.replace(0, np.nan), atol=tolerance, equal_nan=True),
+        "red_overlap_check": np.isclose(numeric["red_positive_area_overlapping_green_fraction"], double_area / red_area.replace(0, np.nan), atol=tolerance, equal_nan=True),
+        "green_overlap_check": np.isclose(numeric["green_positive_area_overlapping_red_fraction"], double_area / green_area.replace(0, np.nan), atol=tolerance, equal_nan=True),
+    })
+
+    failed_rows = int((~checks.fillna(True)).any(axis=1).sum())
+    if failed_rows:
+        log(f"  WARNING: overlap consistency check found {failed_rows} rows with mismatches.")
+    else:
+        log("  Overlap consistency check passed.")
+
+    return {
+        "status": "passed" if failed_rows == 0 else "failed",
+        "n_rows": int(len(df)),
+        "n_failed_rows": failed_rows,
+    }
+
+
+def write_feature_definitions_csv(output_folder, params: PipelineParams):
+    """
+    Save a compact feature-definition table so downstream analysis does not
+    confuse area fractions, Manders coefficients and Pearson correlation.
+    """
+    output_folder = Path(output_folder)
+
+    red_marker = str(getattr(params, "red_marker_name", "MYH11"))
+    green_marker = str(getattr(params, "green_marker_name", "aSMA"))
+
+    rows = [
+        ["red_mean", "Mean red-channel intensity per cell", f"Red marker = {red_marker}; default MYH11"],
+        ["green_mean", "Mean green-channel intensity per cell", f"Green marker = {green_marker}; default aSMA"],
+        ["red_positive", "Cell-level positivity flag using red_mean", "1 if red_mean >= biological_red_threshold"],
+        ["green_positive", "Cell-level positivity flag using green_mean", "1 if green_mean >= biological_green_threshold"],
+        ["double_positive", "Cell-level co-positive flag", "1 if red_positive and green_positive"],
+        ["red_positive_area_fraction_cell", "Area fraction, not Manders", "red-positive pixels / total cell pixels"],
+        ["green_positive_area_fraction_cell", "Area fraction, not Manders", "green-positive pixels / total cell pixels"],
+        ["double_positive_area_fraction_cell", "Area fraction, not Manders", "double-positive pixels / total cell pixels"],
+        ["positive_area_jaccard_index", "Binary positive-area Jaccard index", "double-positive pixels / union-positive pixels"],
+        ["red_positive_area_overlapping_green_fraction", "Binary area-overlap fraction", "double-positive pixels / red-positive pixels"],
+        ["green_positive_area_overlapping_red_fraction", "Binary area-overlap fraction", "double-positive pixels / green-positive pixels"],
+        ["manders_*_red_in_green", "Intensity-weighted Manders M1-like coefficient", "sum(red intensity in green-positive pixels) / sum(red intensity in all cell pixels)"],
+        ["manders_*_green_in_red", "Intensity-weighted Manders M2-like coefficient", "sum(green intensity in red-positive pixels) / sum(green intensity in all cell pixels)"],
+        ["manders_*_thresholded_red_in_green", "Thresholded Manders coefficient", "sum(red intensity in double-positive pixels) / sum(red intensity in red-positive pixels)"],
+        ["manders_*_thresholded_green_in_red", "Thresholded Manders coefficient", "sum(green intensity in double-positive pixels) / sum(green intensity in green-positive pixels)"],
+        ["manders_*_pearson_all_pixels", "Pearson correlation", "Pearson red vs green across all pixels in the cell"],
+        ["manders_*_pearson_positive_union_pixels", "Pearson correlation in positive union", "Pearson red vs green only where red or green is positive"],
+        ["fitted_ellipse_major_axis_px", "Ellipse-based fitted ellipse major axis", "Equivalent ellipse major axis from segmented cell geometry"],
+        ["fitted_ellipse_minor_axis_px", "Ellipse-based fitted ellipse minor axis", "Equivalent ellipse minor axis from segmented cell geometry"],
+        ["elongation_ratio", "Elongation ratio", "fitted_ellipse_major_axis_px / fitted_ellipse_minor_axis_px"],
+        ["ellipse_roundness", "Ellipse-based roundness", "4 * area_px / (pi * fitted_ellipse_major_axis_px^2)"],
+        ["spreading_area_px", "Cell spreading area", "Same as cell area in pixels; exported explicitly for clarity"],
+        ["spreading_index_area_over_fitted_ellipse_area", "Normalized spreading index", "area_px / fitted_ellipse_area_px"],
+    ]
+
+    definitions = pd.DataFrame(rows, columns=["feature", "type", "definition"])
+    out_path = output_folder / "feature_definitions_clean.csv"
+    definitions.to_csv(out_path, index=False)
+    return out_path
 
 
 def compute_and_save_manders(instance_labels, rgb_stack_hwc, df_features, output_folder, params: PipelineParams, log=print):
@@ -1766,6 +1899,7 @@ def compute_and_save_manders(instance_labels, rgb_stack_hwc, df_features, output
             "biological_red_threshold": float(params.biological_red_threshold),
             "biological_green_threshold": float(params.biological_green_threshold),
         }
+        definitions_csv_path = write_feature_definitions_csv(output_folder, params)
         safe_json_dump(summary, output_folder / "manders_summary.json", indent=2)
         compute_and_save_coexpression_summary(
             instance_labels=instance_labels,
@@ -1778,6 +1912,7 @@ def compute_and_save_manders(instance_labels, rgb_stack_hwc, df_features, output
         log("Final cell-level output saved:")
         log(f"  - {merged_csv_path.name}")
         log("  - manders_summary.json")
+        log(f"  - {definitions_csv_path.name}")
         return empty, df_features, summary
 
     df_manders, summary = compute_manders_for_all_cells(
@@ -1801,9 +1936,13 @@ def compute_and_save_manders(instance_labels, rgb_stack_hwc, df_features, output
     df_manders_for_merge = df_manders.drop(columns=duplicate_cell_feature_cols, errors="ignore")
 
     df_merged = df_features.merge(df_manders_for_merge, on="label", how="left")
+    validation_report = validate_overlap_metric_consistency(df_merged, log=log)
     merged_csv_path = output_folder / "cell_features_with_manders.csv"
     df_merged.to_csv(merged_csv_path, index=False)
 
+    definitions_csv_path = write_feature_definitions_csv(output_folder, params)
+
+    summary["overlap_metric_validation"] = validation_report
     summary_json_path = output_folder / "manders_summary.json"
     safe_json_dump(summary, summary_json_path, indent=2)
 
@@ -1820,6 +1959,8 @@ def compute_and_save_manders(instance_labels, rgb_stack_hwc, df_features, output
     log(f"  - {merged_csv_path.name}")
     log("Manders summary saved:")
     log(f"  - {summary_json_path.name}")
+    log("Feature definitions saved:")
+    log(f"  - {definitions_csv_path.name}")
 
     return df_manders, df_merged, summary
 
@@ -1858,8 +1999,8 @@ def compute_and_save_coexpression_summary(instance_labels, rgb_stack_hwc, df_mer
     output_folder = Path(output_folder)
     df = df_merged.copy() if df_merged is not None else pd.DataFrame()
 
-    red_marker = _marker_token(getattr(params, "red_marker_name", "aSMA"))
-    green_marker = _marker_token(getattr(params, "green_marker_name", "MYH11"))
+    red_marker = _marker_token(getattr(params, "red_marker_name", "MYH11"))
+    green_marker = _marker_token(getattr(params, "green_marker_name", "aSMA"))
     pair_marker = f"{red_marker}_{green_marker}"
 
     h, w = instance_labels.shape[:2]
@@ -1883,8 +2024,8 @@ def compute_and_save_coexpression_summary(instance_labels, rgb_stack_hwc, df_mer
     signal_positive_cells = df[(df.get("red_positive", 0) == 1) | (df.get("green_positive", 0) == 1)] if n_cells else pd.DataFrame()
 
     summary = {
-        "red_marker_name": str(getattr(params, "red_marker_name", "aSMA")),
-        "green_marker_name": str(getattr(params, "green_marker_name", "MYH11")),
+        "red_marker_name": str(getattr(params, "red_marker_name", "MYH11")),
+        "green_marker_name": str(getattr(params, "green_marker_name", "aSMA")),
         "pair_marker": pair_marker,
         "n_cells": n_cells,
         "image_area_px": image_area_px,
@@ -1908,20 +2049,20 @@ def compute_and_save_coexpression_summary(instance_labels, rgb_stack_hwc, df_mer
         "double_positive_area_per_cell_px": _safe_divide(double_positive_area_px, n_cells),
         "double_positive_area_fraction_segmented_cell_area": _safe_divide(double_positive_area_px, segmented_cell_area_px),
         "double_positive_area_fraction_image_area": _safe_divide(double_positive_area_px, image_area_px),
-        "red_area_overlap_fraction_image_level": _safe_divide(double_positive_area_px, red_positive_area_px),
-        "green_area_overlap_fraction_image_level": _safe_divide(double_positive_area_px, green_positive_area_px),
-        "overlap_jaccard_pixels_image_level": _safe_divide(double_positive_area_px, union_positive_area_px),
+        "red_positive_area_overlapping_green_fraction_image_level": _safe_divide(double_positive_area_px, red_positive_area_px),
+        "green_positive_area_overlapping_red_fraction_image_level": _safe_divide(double_positive_area_px, green_positive_area_px),
+        "positive_area_jaccard_index_image_level": _safe_divide(double_positive_area_px, union_positive_area_px),
         "median_cell_double_positive_area_fraction": _series_median(df, "double_positive_area_fraction_cell"),
-        "median_cell_overlap_jaccard_pixels": _series_median(signal_positive_cells, "overlap_jaccard_pixels"),
-        "median_cell_red_area_overlap_fraction": _series_median(signal_positive_cells, "red_area_overlap_fraction"),
-        "median_cell_green_area_overlap_fraction": _series_median(signal_positive_cells, "green_area_overlap_fraction"),
-        "median_double_positive_cell_overlap_jaccard_pixels": _series_median(double_positive_cells, "overlap_jaccard_pixels"),
-        "median_double_positive_cell_red_area_overlap_fraction": _series_median(double_positive_cells, "red_area_overlap_fraction"),
-        "median_double_positive_cell_green_area_overlap_fraction": _series_median(double_positive_cells, "green_area_overlap_fraction"),
+        "median_cell_positive_area_jaccard_index": _series_median(signal_positive_cells, "positive_area_jaccard_index"),
+        "median_cell_red_positive_area_overlapping_green_fraction": _series_median(signal_positive_cells, "red_positive_area_overlapping_green_fraction"),
+        "median_cell_green_positive_area_overlapping_red_fraction": _series_median(signal_positive_cells, "green_positive_area_overlapping_red_fraction"),
+        "median_double_positive_cell_positive_area_jaccard_index": _series_median(double_positive_cells, "positive_area_jaccard_index"),
+        "median_double_positive_cell_red_positive_area_overlapping_green_fraction": _series_median(double_positive_cells, "red_positive_area_overlapping_green_fraction"),
+        "median_double_positive_cell_green_positive_area_overlapping_red_fraction": _series_median(double_positive_cells, "green_positive_area_overlapping_red_fraction"),
         "median_manders_biological_red_in_green": _series_median(double_positive_cells, "manders_biological_red_in_green"),
         "median_manders_biological_green_in_red": _series_median(double_positive_cells, "manders_biological_green_in_red"),
-        "median_manders_biological_thresholded_red_in_green": _series_median(double_positive_cells, "manders_biological_thresholded_manders_red_in_green"),
-        "median_manders_biological_thresholded_green_in_red": _series_median(double_positive_cells, "manders_biological_thresholded_manders_green_in_red"),
+        "median_manders_biological_thresholded_red_in_green": _series_median(double_positive_cells, "manders_biological_thresholded_red_in_green"),
+        "median_manders_biological_thresholded_green_in_red": _series_median(double_positive_cells, "manders_biological_thresholded_green_in_red"),
         "median_pearson_biological_all_pixels": _series_median(double_positive_cells, "manders_biological_pearson_all_pixels"),
         "median_pearson_biological_positive_union_pixels": _series_median(double_positive_cells, "manders_biological_pearson_positive_union_pixels"),
     }
@@ -1932,8 +2073,8 @@ def compute_and_save_coexpression_summary(instance_labels, rgb_stack_hwc, df_mer
     summary[f"n_{pair_marker}_double_positive_cells"] = n_double_positive
     summary[f"{pair_marker}_double_positive_area_px"] = double_positive_area_px
     summary[f"{pair_marker}_double_positive_area_per_cell_px"] = summary["double_positive_area_per_cell_px"]
-    summary[f"{red_marker}_area_overlapping_{green_marker}_fraction_image_level"] = summary["red_area_overlap_fraction_image_level"]
-    summary[f"{green_marker}_area_overlapping_{red_marker}_fraction_image_level"] = summary["green_area_overlap_fraction_image_level"]
+    summary[f"{red_marker}_positive_area_overlapping_{green_marker}_fraction_image_level"] = summary["red_positive_area_overlapping_green_fraction_image_level"]
+    summary[f"{green_marker}_positive_area_overlapping_{red_marker}_fraction_image_level"] = summary["green_positive_area_overlapping_red_fraction_image_level"]
 
     csv_path = output_folder / "image_level_summary.csv"
     json_path = output_folder / "coexpression_summary.json"
@@ -2118,8 +2259,8 @@ def save_representative_center_visualizations(instance_labels, rgb_stack_hwc, bl
     red_pos = (red_center >= red_thr) & cell_mask_center
     green_pos = (green_center >= green_thr) & cell_mask_center
 
-    red_marker = _marker_token(getattr(params, 'red_marker_name', 'aSMA'))
-    green_marker = _marker_token(getattr(params, 'green_marker_name', 'MYH11'))
+    red_marker = _marker_token(getattr(params, 'red_marker_name', 'MYH11'))
+    green_marker = _marker_token(getattr(params, 'green_marker_name', 'aSMA'))
 
     _save_png_rgb(output_folder / '01_center_original_rgb.png', rgb_center_u8)
     _save_png_rgb(output_folder / '02_center_cellmask_dapi.png', _make_cellmask_dapi_overlay(labels_center, blue_center, fill_color=(0, 220, 180), alpha=0.35))
